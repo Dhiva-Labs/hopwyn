@@ -1,8 +1,13 @@
 //! The Hopwyn service: capture, injection, discovery, pairing and the
-//! encrypted link, driven by the handoff engine. Runs on its own thread;
-//! the UI talks to it with [`Command`]s and hears back through [`UiEvent`]s.
+//! encrypted links, driven by one handoff engine per paired computer. Runs
+//! on its own thread; the UI talks to it with [`Command`]s and hears back
+//! through [`UiEvent`]s.
+//!
+//! Up to four computers can be paired, one beyond each screen edge. Only
+//! one of them takes part in a handoff at a time: while the cursor is on
+//! (or coming from) one neighbour, the others are told to keep their own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,15 +23,17 @@ use hopwyn_proto::{Edge, Message};
 use hopwyn_transport::{Node, PeerConnection, PeerSender, TrustStore};
 use tokio::sync::{mpsc, watch};
 
-use crate::config::{self, Partner, Store};
+use crate::config::{self, MAX_PARTNERS, Partner, Store};
 use crate::pairing_net::{self, PAIRING_PORT, PairNetError};
 
 const LINK_PORT: u16 = 4242;
 const TICK: Duration = Duration::from_millis(100);
 const RETRY: Duration = Duration::from_secs(2);
+const DIAL_TIMEOUT: Duration = Duration::from_secs(4);
 const SESSION_SETTLE: Duration = Duration::from_millis(150);
 /// Far enough to cross any screen in one move.
 const PUSH: f32 = 20_000.0;
+const ALL_EDGES: [Edge; 4] = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom];
 
 /// What the UI asks for.
 #[derive(Debug, Clone)]
@@ -39,10 +46,14 @@ pub enum Command {
         ip: IpAddr,
         code: String,
     },
-    /// Where the partner's screen sits relative to this one.
-    SetEdge(Edge),
-    /// Forget the partner device.
-    Forget,
+    /// Where a paired computer's screen sits relative to this one. If
+    /// another paired computer is on that side, the two swap.
+    SetEdge {
+        id: DeviceId,
+        edge: Edge,
+    },
+    /// Forget a paired computer.
+    Forget(DeviceId),
     Quit,
 }
 
@@ -51,17 +62,10 @@ pub enum Command {
 pub enum Control {
     /// This computer's own mouse and keyboard drive it.
     Local,
-    /// This computer's mouse and keyboard drive the partner.
-    ControllingPartner,
-    /// The partner's mouse and keyboard drive this computer.
-    ControlledByPartner,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Link {
-    NoPartner,
-    Searching,
-    Connected,
+    /// This computer's mouse and keyboard drive that paired computer.
+    Controlling(DeviceId),
+    /// That paired computer's mouse and keyboard drive this one.
+    ControlledBy(DeviceId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,11 +84,12 @@ pub enum UiEvent {
         name: String,
         short_id: String,
     },
+    /// Which paired computers are connected, and who is in control.
     Status {
-        link: Link,
+        connected: Vec<DeviceId>,
         control: Control,
     },
-    Partner(Option<Partner>),
+    Partners(Vec<Partner>),
     Nearby(Vec<Nearby>),
     PairingCode(String),
     PairingDone(String),
@@ -114,16 +119,16 @@ fn run(
 ) -> Result<(), String> {
     let store = Store::open_default()?;
     let identity = Arc::new(store.identity(&config::device_name())?);
-    let partner = store.partner();
+    let partners = store.partners();
 
     // Capture first: on GNOME its dialog fails to appear if requested right
     // after a remote-control session closes.
     let _ = ui.send_blocking(UiEvent::Waiting(
         "Allow Hopwyn to capture input in the desktop's dialog".into(),
     ));
-    let edge = partner.as_ref().map_or(Edge::Right, |p| p.edge);
     let (capture, capture_rx) =
-        LinuxCapture::start_with_token(edge, store.capture_token()).map_err(|e| e.to_string())?;
+        LinuxCapture::start_with_token(capture_edges(&partners), store.capture_token())
+            .map_err(|e| e.to_string())?;
     if let Some(t) = capture.restore_token() {
         let _ = store.save_capture_token(t);
     }
@@ -155,7 +160,7 @@ fn run(
             ui.clone(),
             store,
             identity,
-            partner,
+            partners,
             token,
             capture,
             capture_rx,
@@ -165,12 +170,25 @@ fn run(
     })
 }
 
+/// The edges to put barriers on. With nothing paired, keep one on the
+/// right so the capture session stays valid; hits there are released.
+fn capture_edges(partners: &[Partner]) -> Vec<Edge> {
+    if partners.is_empty() {
+        vec![Edge::Right]
+    } else {
+        partners.iter().map(|p| p.edge).collect()
+    }
+}
+
 /// Everything the main loop reacts to besides UI commands.
 enum Internal {
     Capture(CaptureEvent),
-    Connected(PeerSender, mpsc::UnboundedReceiver<Message>),
-    PeerMessage(Message),
-    PeerGone,
+    /// A link to a paired computer is up.
+    Connected(DeviceId, PeerSender, mpsc::UnboundedReceiver<Message>),
+    /// A message on a link; the number tells a link's messages apart from
+    /// those of the link it replaced.
+    PeerMessage(DeviceId, u64, Message),
+    PeerGone(DeviceId, u64),
     Nearby(HashMap<DeviceId, (String, SocketAddr)>),
     Paired(
         Result<PairedPeer, PairNetError>,
@@ -179,26 +197,33 @@ enum Internal {
     ),
 }
 
+/// One paired computer and the state of the handoff with it.
+struct Peer {
+    partner: Partner,
+    engine: Engine,
+    sender: Option<PeerSender>,
+    generation: u64,
+}
+
 struct Service {
     ui: async_channel::Sender<UiEvent>,
     store: Store,
     identity: Arc<Identity>,
-    partner: Option<Partner>,
-    partner_tx: watch::Sender<Option<Partner>>,
+    peers: Vec<Peer>,
+    partners_tx: watch::Sender<Vec<Partner>>,
+    connected: Arc<Mutex<HashSet<DeviceId>>>,
     token: Option<String>,
     capture: LinuxCapture,
     trust: TrustStore,
     tx: mpsc::UnboundedSender<Internal>,
     rx: mpsc::UnboundedReceiver<Internal>,
     _discovery: Discovery,
-    engine: Engine,
-    sender: Option<PeerSender>,
     emulator: Option<LinuxEmulator>,
-    redial_tx: mpsc::UnboundedSender<()>,
     nearby: HashMap<DeviceId, (String, SocketAddr)>,
     pairing: Option<tokio::task::JoinHandle<()>>,
     limiter: PairingLimiter,
-    last_status: Option<(Link, Control)>,
+    next_generation: u64,
+    last_status: Option<(Vec<DeviceId>, Control)>,
 }
 
 impl Service {
@@ -206,14 +231,14 @@ impl Service {
         ui: async_channel::Sender<UiEvent>,
         store: Store,
         identity: Arc<Identity>,
-        partner: Option<Partner>,
+        partners: Vec<Partner>,
         token: Option<String>,
         capture: LinuxCapture,
         capture_rx: std::sync::mpsc::Receiver<CaptureEvent>,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::unbounded_channel();
         let trust = TrustStore::new();
-        if let Some(p) = &partner {
+        for p in &partners {
             trust.add(p.id);
         }
         let node = Arc::new(
@@ -226,8 +251,9 @@ impl Service {
         );
         let (discovery, found) =
             Discovery::start(&identity, LINK_PORT).map_err(|e| e.to_string())?;
-        let (partner_tx, partner_rx) = watch::channel(partner.clone());
+        let (partners_tx, partners_rx) = watch::channel(partners.clone());
         let addresses: Arc<Mutex<HashMap<DeviceId, SocketAddr>>> = Arc::default();
+        let connected: Arc<Mutex<HashSet<DeviceId>>> = Arc::default();
 
         // Capture events: std channel -> loop.
         let cap_tx = tx.clone();
@@ -239,7 +265,7 @@ impl Service {
             }
         });
 
-        // Discovery: keep the nearby list and the partner's address current.
+        // Discovery: keep the nearby list and paired computers' addresses current.
         let disc_tx = tx.clone();
         let disc_addrs = addresses.clone();
         std::thread::spawn(move || {
@@ -264,15 +290,14 @@ impl Service {
             }
         });
 
-        // Incoming links, from the current partner only.
+        // Incoming links, from paired computers only.
         let acc_tx = tx.clone();
         let acc_node = node.clone();
-        let acc_partner = partner_rx.clone();
+        let acc_partners = partners_rx.clone();
         tokio::spawn(async move {
             while let Some(result) = acc_node.accept().await {
-                let want = acc_partner.borrow().as_ref().map(|p| p.id);
                 match result {
-                    Ok(conn) if Some(conn.peer()) == want => {
+                    Ok(conn) if acc_partners.borrow().iter().any(|p| p.id == conn.peer()) => {
                         if hand_over(conn, &acc_tx).is_err() {
                             break;
                         }
@@ -283,63 +308,78 @@ impl Service {
             }
         });
 
-        // Outgoing links: the device with the higher key dials, so there is
-        // never a duplicate connection.
-        let (redial_tx, mut redial_rx) = mpsc::unbounded_channel::<()>();
+        // Outgoing links: for each pair of computers the one with the higher
+        // key dials, so there is never a duplicate connection.
         let dial_tx = tx.clone();
         let me = identity.id();
-        let mut dial_partner = partner_rx;
+        let mut dial_partners = partners_rx;
+        let dial_connected = connected.clone();
         tokio::spawn(async move {
             loop {
-                let target = dial_partner.borrow().clone();
-                let Some(p) = target.filter(|p| me.as_bytes() > p.id.as_bytes()) else {
-                    if dial_partner.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
-                };
-                let addr = addresses.lock().ok().and_then(|m| m.get(&p.id).copied());
-                if let Some(addr) = addr
-                    && let Ok(conn) = node.connect(addr).await
-                {
-                    if conn.peer() == p.id {
+                let targets: Vec<DeviceId> = dial_partners
+                    .borrow()
+                    .iter()
+                    .map(|p| p.id)
+                    .filter(|id| me.as_bytes() > id.as_bytes())
+                    .collect();
+                for id in targets {
+                    let up = dial_connected
+                        .lock()
+                        .map(|c| c.contains(&id))
+                        .unwrap_or(true);
+                    let addr = addresses.lock().ok().and_then(|m| m.get(&id).copied());
+                    let Some(addr) = addr.filter(|_| !up) else {
+                        continue;
+                    };
+                    if let Ok(Ok(conn)) =
+                        tokio::time::timeout(DIAL_TIMEOUT, node.connect(addr)).await
+                    {
+                        if conn.peer() != id {
+                            conn.close();
+                            continue;
+                        }
+                        if let Ok(mut c) = dial_connected.lock() {
+                            c.insert(id);
+                        }
                         if hand_over(conn, &dial_tx).is_err() {
                             return;
                         }
-                        if redial_rx.recv().await.is_none() {
-                            return;
-                        }
-                        continue;
                     }
-                    conn.close();
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(RETRY) => {}
-                    r = dial_partner.changed() => if r.is_err() { return },
+                    r = dial_partners.changed() => if r.is_err() { return },
                 }
             }
         });
 
-        let engine = Engine::new(engine_config(&identity, partner.as_ref()));
+        let peers = partners
+            .into_iter()
+            .map(|partner| Peer {
+                engine: Engine::new(engine_config(&identity, &partner)),
+                partner,
+                sender: None,
+                generation: 0,
+            })
+            .collect();
         Ok(Self {
             ui,
             store,
             identity,
-            partner,
-            partner_tx,
+            peers,
+            partners_tx,
+            connected,
             token,
             capture,
             trust,
             tx,
             rx,
             _discovery: discovery,
-            engine,
-            sender: None,
             emulator: None,
-            redial_tx,
             nearby: HashMap::new(),
             pairing: None,
             limiter: PairingLimiter::new(),
+            next_generation: 1,
             last_status: None,
         })
     }
@@ -348,58 +388,115 @@ impl Service {
         let _ = self.ui.send_blocking(ev);
     }
 
+    fn partners(&self) -> Vec<Partner> {
+        self.peers.iter().map(|p| p.partner.clone()).collect()
+    }
+
+    fn peer_index(&self, id: &DeviceId) -> Option<usize> {
+        self.peers.iter().position(|p| &p.partner.id == id)
+    }
+
+    /// The peer taking part in a handoff right now, if any.
+    fn busy(&self) -> Option<usize> {
+        self.peers
+            .iter()
+            .position(|p| p.engine.state() != State::Idle)
+    }
+
     async fn run(mut self, mut cmds: mpsc::UnboundedReceiver<Command>) -> Result<(), String> {
-        self.send_ui(UiEvent::Partner(self.partner.clone()));
+        self.send_ui(UiEvent::Partners(self.partners()));
         self.publish_status();
         let mut tick = tokio::time::interval(TICK);
         loop {
-            let input = tokio::select! {
-                _ = tick.tick() => Some(Input::Tick),
+            tokio::select! {
+                _ = tick.tick() => {
+                    for i in 0..self.peers.len() {
+                        self.step(i, Input::Tick).await;
+                    }
+                }
                 cmd = cmds.recv() => match cmd {
                     None | Some(Command::Quit) => break,
-                    Some(c) => { self.on_command(c); None }
+                    Some(c) => self.on_command(c),
                 },
                 ev = self.rx.recv() => match ev {
                     None => break,
-                    Some(ev) => self.on_internal(ev),
+                    Some(ev) => self.on_internal(ev).await,
                 },
-            };
-            if let Some(input) = input {
-                self.step(input).await;
             }
+            self.close_idle_emulator().await;
             self.publish_status();
+        }
+        for p in &self.peers {
+            if let Some(s) = &p.sender {
+                s.close();
+            }
         }
         Ok(())
     }
 
-    fn on_internal(&mut self, ev: Internal) -> Option<Input> {
+    async fn on_internal(&mut self, ev: Internal) {
         match ev {
-            Internal::Capture(c) => Some(Input::Capture(c)),
-            Internal::PeerMessage(m) => Some(Input::Peer(m)),
-            Internal::Connected(s, mut rx) => {
-                if let Some(old) = self.sender.replace(s) {
-                    old.close();
+            Internal::Capture(c) => self.on_capture(c).await,
+            Internal::PeerMessage(id, generation, m) => {
+                let Some(i) = self.peer_index(&id) else {
+                    return;
+                };
+                if self.peers.get(i).map(|p| p.generation) != Some(generation) {
+                    return;
+                }
+                // Someone else has the cursor: this one keeps its own.
+                if matches!(m, Message::Enter { .. }) && self.busy().is_some_and(|b| b != i) {
+                    self.debug(&format!("refusing Enter from {}", self.name(i)));
+                    if let Some(s) = self.peers.get_mut(i).and_then(|p| p.sender.as_mut()) {
+                        let _ = s.send(&Message::Leave).await;
+                    }
+                    return;
+                }
+                self.step(i, Input::Peer(m)).await;
+            }
+            Internal::Connected(id, sender, mut rx) => {
+                let Some(i) = self.peer_index(&id) else {
+                    sender.close();
+                    if let Ok(mut c) = self.connected.lock() {
+                        c.remove(&id);
+                    }
+                    return;
+                };
+                let generation = self.next_generation;
+                self.next_generation += 1;
+                if let Ok(mut c) = self.connected.lock() {
+                    c.insert(id);
+                }
+                if let Some(peer) = self.peers.get_mut(i) {
+                    if let Some(old) = peer.sender.replace(sender) {
+                        old.close();
+                    }
+                    peer.generation = generation;
                 }
                 let fwd = self.tx.clone();
                 tokio::spawn(async move {
                     while let Some(m) = rx.recv().await {
-                        if fwd.send(Internal::PeerMessage(m)).is_err() {
+                        if fwd.send(Internal::PeerMessage(id, generation, m)).is_err() {
                             return;
                         }
                     }
-                    let _ = fwd.send(Internal::PeerGone);
+                    let _ = fwd.send(Internal::PeerGone(id, generation));
                 });
-                Some(Input::PeerConnected)
+                self.debug(&format!("connected to {}", self.name(i)));
+                self.step(i, Input::PeerConnected).await;
             }
-            Internal::PeerGone => {
-                self.sender = None;
-                let _ = self.redial_tx.send(());
-                Some(Input::PeerDisconnected)
+            Internal::PeerGone(id, generation) => {
+                let Some(i) = self.peer_index(&id) else {
+                    return;
+                };
+                if self.peers.get(i).map(|p| p.generation) != Some(generation) {
+                    return;
+                }
+                self.disconnect(i).await;
             }
             Internal::Nearby(map) => {
                 self.nearby = map;
                 self.publish_nearby();
-                None
             }
             Internal::Paired(result, initiator, limiter) => {
                 self.pairing = None;
@@ -410,8 +507,130 @@ impl Service {
                     Ok(peer) => self.adopt_partner(peer, initiator),
                     Err(e) => self.send_ui(UiEvent::PairingFailed(e.to_string())),
                 }
-                None
             }
+        }
+    }
+
+    /// Routes a capture event to the engine it belongs to.
+    async fn on_capture(&mut self, ev: CaptureEvent) {
+        let target = match (ev, self.busy()) {
+            (CaptureEvent::Activated { edge, .. }, Some(b)) => {
+                let state = self.peers.get(b).map(|p| p.engine.state());
+                let facing = self.peers.get(b).map(|p| p.partner.edge) == Some(edge);
+                match state {
+                    // Placement, or the cursor coming back to that neighbour.
+                    Some(State::Entering { .. }) => Some(b),
+                    Some(State::Receiving) if facing => Some(b),
+                    // Already sending: nothing new can start.
+                    Some(State::Sending) => None,
+                    // Controlled by one neighbour, the cursor hit another's
+                    // edge: keep it here. (Passing it on is not supported yet.)
+                    _ => {
+                        let _ = self.capture.release();
+                        None
+                    }
+                }
+            }
+            (CaptureEvent::Activated { edge, .. }, None) => {
+                let i = self.peers.iter().position(|p| p.partner.edge == edge);
+                if i.is_none() {
+                    let _ = self.capture.release();
+                }
+                i
+            }
+            (_, busy) => busy,
+        };
+        if let Some(i) = target {
+            self.step(i, Input::Capture(ev)).await;
+        }
+    }
+
+    /// Feeds one engine and carries out what it asks for.
+    async fn step(&mut self, i: usize, input: Input) {
+        let now = Instant::now();
+        let Some(peer) = self.peers.get_mut(i) else {
+            return;
+        };
+        let before = peer.engine.state();
+        let actions = peer.engine.handle(input.clone(), now);
+        if debug_on()
+            && !matches!(
+                input,
+                Input::Tick
+                    | Input::Capture(CaptureEvent::Input(_))
+                    | Input::Peer(Message::PointerMotion { .. })
+            )
+        {
+            eprintln!(
+                "[hopwyn {}] {}: {input:?} ({before:?} -> {:?})",
+                stamp(),
+                peer.partner.name,
+                peer.engine.state()
+            );
+        }
+        let edge = peer.partner.edge;
+        let mut lost = false;
+        for action in actions {
+            if debug_on()
+                && !matches!(
+                    action,
+                    Action::Inject(_) | Action::Send(Message::PointerMotion { .. })
+                )
+            {
+                eprintln!("[hopwyn {}]   do: {action:?}", stamp());
+            }
+            match action {
+                Action::Send(m) => {
+                    if let Some(s) = self.peers.get_mut(i).and_then(|p| p.sender.as_mut())
+                        && s.send(&m).await.is_err()
+                    {
+                        lost = true;
+                    }
+                }
+                Action::Inject(ev) => {
+                    if let Some(emu) = self.emulator.as_ref() {
+                        let _ = emu.send(ev);
+                    }
+                }
+                Action::ReleaseCapture { position } => {
+                    let _ = match position {
+                        Some(p) => self.capture.release_at(p),
+                        None => self.capture.release(),
+                    };
+                }
+                Action::PushToEdge => self.push_to_edge(edge),
+            }
+        }
+        if lost {
+            Box::pin(self.disconnect(i)).await;
+        }
+    }
+
+    /// The link to peer `i` is gone: forget its sender, put its engine back.
+    async fn disconnect(&mut self, i: usize) {
+        let Some(peer) = self.peers.get_mut(i) else {
+            return;
+        };
+        if let Some(s) = peer.sender.take() {
+            s.close();
+        }
+        peer.generation = 0;
+        let id = peer.partner.id;
+        if let Ok(mut c) = self.connected.lock() {
+            c.remove(&id);
+        }
+        self.debug(&format!("lost the link to {}", self.name(i)));
+        self.step(i, Input::PeerDisconnected).await;
+    }
+
+    /// Not driven by any neighbour any more: close the remote-control
+    /// session and re-arm capture.
+    async fn close_idle_emulator(&mut self) {
+        let needed = self.peers.iter().any(|p| p.engine.needs_injection());
+        if !needed && self.emulator.is_some() {
+            self.emulator = None;
+            tokio::time::sleep(SESSION_SETTLE).await;
+            let _ = self.capture.enable();
         }
     }
 
@@ -431,6 +650,10 @@ impl Service {
                     ));
                     return;
                 };
+                if self.peers.len() >= MAX_PARTNERS {
+                    self.send_ui(UiEvent::PairingFailed(full_message()));
+                    return;
+                }
                 if let Some(h) = self.pairing.take() {
                     h.abort();
                 }
@@ -446,34 +669,69 @@ impl Service {
                     let _ = tx.send(Internal::Paired(r, false, None));
                 }));
             }
-            Command::SetEdge(edge) => {
-                if let Some(p) = self.partner.as_mut() {
-                    p.edge = edge;
-                    let p = p.clone();
-                    let _ = self.store.save_partner(Some(&p));
-                    let _ = self.capture.set_edge(edge);
-                    self.reset_engine();
-                    self.send_ui(UiEvent::Partner(Some(p)));
+            Command::SetEdge { id, edge } => {
+                let Some(i) = self.peer_index(&id) else {
+                    return;
+                };
+                let Some(old) = self.peers.get(i).map(|p| p.partner.edge) else {
+                    return;
+                };
+                if old == edge {
+                    return;
                 }
+                // Whoever was on that side moves to this one's old side.
+                if let Some(j) = self.peers.iter().position(|p| p.partner.edge == edge) {
+                    if let Some(p) = self.peers.get_mut(j) {
+                        p.partner.edge = old;
+                    }
+                    self.reset_engine(j);
+                }
+                if let Some(p) = self.peers.get_mut(i) {
+                    p.partner.edge = edge;
+                }
+                self.reset_engine(i);
+                self.partners_changed();
             }
-            Command::Forget => {
-                if let Some(p) = self.partner.take() {
-                    self.trust.remove(&p.id);
+            Command::Forget(id) => {
+                let Some(i) = self.peer_index(&id) else {
+                    return;
+                };
+                if self
+                    .peers
+                    .get(i)
+                    .is_some_and(|p| p.engine.state() == State::Sending)
+                {
+                    let _ = self.capture.release();
                 }
-                let _ = self.store.save_partner(None);
-                if let Some(s) = self.sender.take() {
+                let peer = self.peers.remove(i);
+                self.trust.remove(&peer.partner.id);
+                if let Some(s) = peer.sender {
                     s.close();
                 }
-                let _ = self.partner_tx.send(None);
-                self.reset_engine();
-                self.send_ui(UiEvent::Partner(None));
+                if let Ok(mut c) = self.connected.lock() {
+                    c.remove(&id);
+                }
+                self.partners_changed();
                 self.publish_nearby();
             }
             Command::Quit => {}
         }
     }
 
+    /// Saves the partner list and tells capture, the dialer and the UI.
+    fn partners_changed(&mut self) {
+        let partners = self.partners();
+        let _ = self.store.save_partners(&partners);
+        let _ = self.capture.set_edges(capture_edges(&partners));
+        let _ = self.partners_tx.send(partners.clone());
+        self.send_ui(UiEvent::Partners(partners));
+    }
+
     fn start_pairing(&mut self) {
+        if self.peers.len() >= MAX_PARTNERS {
+            self.send_ui(UiEvent::PairingFailed(full_message()));
+            return;
+        }
         if let Some(h) = self.pairing.take() {
             h.abort();
         }
@@ -508,88 +766,60 @@ impl Service {
     }
 
     fn adopt_partner(&mut self, peer: PairedPeer, initiator: bool) {
-        if let Some(old) = self.partner.take() {
-            self.trust.remove(&old.id);
+        // Pairing again with a known computer just refreshes its name.
+        if let Some(i) = self.peer_index(&peer.id) {
+            if let Some(p) = self.peers.get_mut(i) {
+                p.partner.name.clone_from(&peer.name);
+            }
+            self.partners_changed();
+            self.send_ui(UiEvent::PairingDone(peer.name));
+            return;
         }
-        // Default layout: the code-showing device has the newcomer on its
-        // right; the newcomer has it on the left. Either can change it.
-        let edge = if initiator { Edge::Right } else { Edge::Left };
+        // Default layout: the code-showing computer has the newcomer on its
+        // right, the newcomer has it on its left; otherwise the first free
+        // side. Either can change it.
+        let preferred = if initiator { Edge::Right } else { Edge::Left };
+        let taken: Vec<Edge> = self.peers.iter().map(|p| p.partner.edge).collect();
+        let Some(edge) = std::iter::once(preferred)
+            .chain(ALL_EDGES)
+            .find(|e| !taken.contains(e))
+        else {
+            self.send_ui(UiEvent::PairingFailed(full_message()));
+            return;
+        };
         let partner = Partner {
             id: peer.id,
             name: peer.name.clone(),
             edge,
         };
         self.trust.add(peer.id);
-        let _ = self.store.save_partner(Some(&partner));
-        let _ = self.capture.set_edge(edge);
-        self.partner = Some(partner.clone());
-        let _ = self.partner_tx.send(Some(partner.clone()));
-        self.reset_engine();
+        self.peers.push(Peer {
+            engine: Engine::new(engine_config(&self.identity, &partner)),
+            partner,
+            sender: None,
+            generation: 0,
+        });
+        self.partners_changed();
         self.send_ui(UiEvent::PairingDone(peer.name));
-        self.send_ui(UiEvent::Partner(Some(partner)));
         self.publish_nearby();
     }
 
-    fn reset_engine(&mut self) {
-        if matches!(self.engine.state(), State::Sending) {
-            let _ = self.capture.release();
-        }
-        self.engine = Engine::new(engine_config(&self.identity, self.partner.as_ref()));
-        if self.sender.is_some() {
-            self.engine.handle(Input::PeerConnected, Instant::now());
-        }
-    }
-
-    async fn step(&mut self, input: Input) {
-        if self.partner.is_none() && matches!(input, Input::Capture(CaptureEvent::Activated { .. }))
-        {
-            let _ = self.capture.release();
+    /// A fresh engine for peer `i` (its side changed).
+    fn reset_engine(&mut self, i: usize) {
+        let identity = self.identity.clone();
+        let Some(peer) = self.peers.get_mut(i) else {
             return;
+        };
+        if peer.engine.state() == State::Sending {
+            let _ = self.capture.release();
         }
-        let mut lost = false;
-        for action in self.engine.handle(input, Instant::now()) {
-            match action {
-                Action::Send(m) => {
-                    if let Some(s) = self.sender.as_mut()
-                        && s.send(&m).await.is_err()
-                    {
-                        lost = true;
-                    }
-                }
-                Action::Inject(ev) => {
-                    if let Some(emu) = self.emulator.as_ref() {
-                        let _ = emu.send(ev);
-                    }
-                }
-                Action::ReleaseCapture { position } => {
-                    let _ = match position {
-                        Some(p) => self.capture.release_at(p),
-                        None => self.capture.release(),
-                    };
-                }
-                Action::PushToEdge => self.push_to_edge(),
-            }
-        }
-        if lost {
-            if let Some(s) = self.sender.take() {
-                s.close();
-            }
-            for action in self.engine.handle(Input::PeerDisconnected, Instant::now()) {
-                if let Action::ReleaseCapture { .. } = action {
-                    let _ = self.capture.release();
-                }
-            }
-        }
-        // Not driven by the partner any more: close the remote-control
-        // session and re-arm capture.
-        if !self.engine.needs_injection() && self.emulator.is_some() {
-            self.emulator = None;
-            tokio::time::sleep(SESSION_SETTLE).await;
-            let _ = self.capture.enable();
+        peer.engine = Engine::new(engine_config(&identity, &peer.partner));
+        if peer.sender.is_some() {
+            peer.engine.handle(Input::PeerConnected, Instant::now());
         }
     }
 
-    fn push_to_edge(&mut self) {
+    fn push_to_edge(&mut self, edge: Edge) {
         if self.emulator.is_none() {
             let restore = self.token.clone();
             match tokio::task::block_in_place(|| LinuxEmulator::connect(restore.as_deref())) {
@@ -602,12 +832,14 @@ impl Service {
                     }
                     self.emulator = Some(e);
                 }
-                Err(e) => self.send_ui(UiEvent::Error(format!(
-                    "could not take control of this desktop: {e}"
-                ))),
+                Err(e) => {
+                    self.debug(&format!("remote control failed: {e}"));
+                    self.send_ui(UiEvent::Error(format!(
+                        "could not take control of this desktop: {e}"
+                    )));
+                }
             }
         }
-        let edge = self.partner.as_ref().map_or(Edge::Right, |p| p.edge);
         let (dx, dy) = match edge {
             Edge::Right => (PUSH, 0.0),
             Edge::Left => (-PUSH, 0.0),
@@ -620,52 +852,74 @@ impl Service {
     }
 
     fn publish_status(&mut self) {
-        let link = match (&self.partner, &self.sender) {
-            (None, _) => Link::NoPartner,
-            (Some(_), None) => Link::Searching,
-            (Some(_), Some(_)) => Link::Connected,
-        };
-        let control = match self.engine.state() {
-            State::Idle => Control::Local,
-            State::Sending => Control::ControllingPartner,
-            State::Entering { .. } | State::Receiving => Control::ControlledByPartner,
-        };
-        if self.last_status.as_ref() != Some(&(link.clone(), control)) {
-            self.last_status = Some((link.clone(), control));
-            self.send_ui(UiEvent::Status { link, control });
+        let connected: Vec<DeviceId> = self
+            .peers
+            .iter()
+            .filter(|p| p.sender.is_some())
+            .map(|p| p.partner.id)
+            .collect();
+        let control = self
+            .peers
+            .iter()
+            .find_map(|p| match p.engine.state() {
+                State::Idle => None,
+                State::Sending => Some(Control::Controlling(p.partner.id)),
+                State::Entering { .. } | State::Receiving => {
+                    Some(Control::ControlledBy(p.partner.id))
+                }
+            })
+            .unwrap_or(Control::Local);
+        let status = (connected, control);
+        if self.last_status.as_ref() != Some(&status) {
+            self.last_status = Some(status.clone());
+            self.send_ui(UiEvent::Status {
+                connected: status.0,
+                control: status.1,
+            });
         }
     }
 
     fn publish_nearby(&self) {
-        let paired = self.partner.as_ref().map(|p| p.id);
         let mut list: Vec<Nearby> = self
             .nearby
             .iter()
             .map(|(id, (name, addr))| Nearby {
                 name: name.clone(),
                 ip: addr.ip(),
-                paired: Some(*id) == paired,
+                paired: self.peer_index(id).is_some(),
             })
             .collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         self.send_ui(UiEvent::Nearby(list));
     }
+
+    fn name(&self, i: usize) -> String {
+        self.peers
+            .get(i)
+            .map(|p| p.partner.name.clone())
+            .unwrap_or_default()
+    }
+
+    fn debug(&self, text: &str) {
+        if debug_on() {
+            eprintln!("[hopwyn {}] {text}", stamp());
+        }
+    }
 }
 
-fn engine_config(identity: &Identity, partner: Option<&Partner>) -> Config {
-    match partner {
-        Some(p) => Config {
-            edge: p.edge,
-            wins_ties: identity.id().as_bytes() < p.id.as_bytes(),
-        },
-        None => Config {
-            edge: Edge::Right,
-            wins_ties: true,
-        },
+fn full_message() -> String {
+    format!("Hopwyn is paired with {MAX_PARTNERS} computers, one on each side. Forget one first.")
+}
+
+fn engine_config(identity: &Identity, partner: &Partner) -> Config {
+    Config {
+        edge: partner.edge,
+        wins_ties: identity.id().as_bytes() < partner.id.as_bytes(),
     }
 }
 
 fn hand_over(conn: PeerConnection, tx: &mpsc::UnboundedSender<Internal>) -> Result<(), ()> {
+    let id = conn.peer();
     let (sender, mut receiver) = conn.split();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -675,5 +929,25 @@ fn hand_over(conn: PeerConnection, tx: &mpsc::UnboundedSender<Internal>) -> Resu
             }
         }
     });
-    tx.send(Internal::Connected(sender, msg_rx)).map_err(|_| ())
+    tx.send(Internal::Connected(id, sender, msg_rx))
+        .map_err(|_| ())
+}
+
+fn debug_on() -> bool {
+    std::env::var_os("HOPWYN_DEBUG").is_some()
+}
+
+/// Wall-clock time of day, for comparing logs from two computers.
+fn stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60,
+        now.subsec_millis()
+    )
 }

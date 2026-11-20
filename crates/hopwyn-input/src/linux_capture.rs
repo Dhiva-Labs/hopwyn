@@ -6,6 +6,7 @@
 //! (the local cursor stops moving) until [`LinuxCapture::release`] is
 //! called, the user presses Ctrl+Alt+Esc, or the desktop ends it.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc as std_mpsc;
@@ -15,9 +16,9 @@ use std::thread;
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::Session;
 use ashpd::desktop::input_capture::{
-    Barrier, BarrierPosition, Capabilities, ConnectToEISOptions, CreateSession2Options,
-    CreateSessionOptions, EnableOptions, GetZonesOptions, InputCapture, ReleaseOptions,
-    SetPointerBarriersOptions, StartOptions,
+    ActivatedBarrier, Barrier, BarrierPosition, Capabilities, ConnectToEISOptions,
+    CreateSession2Options, CreateSessionOptions, EnableOptions, GetZonesOptions, InputCapture,
+    ReleaseOptions, SetPointerBarriersOptions, StartOptions,
 };
 use futures_util::StreamExt;
 use hopwyn_proto::Edge;
@@ -27,7 +28,7 @@ use tokio::sync::mpsc;
 
 use crate::capture::{
     CaptureEvent, KeyOutcome, Rect, ReleaseReason, Translator, edge_barriers, edge_position,
-    release_point,
+    nearest_edge, release_point,
 };
 use crate::{InputError, InputEvent};
 
@@ -43,8 +44,8 @@ enum Command {
     Release(Option<f32>),
     /// Turn capture back on after the desktop disabled it.
     Enable,
-    /// Move the barrier to another screen edge.
-    SetEdge(Edge),
+    /// Put barriers on these screen edges instead.
+    SetEdges(Vec<Edge>),
 }
 
 /// Captures input at one screen edge. Dropping it ends the session.
@@ -58,7 +59,7 @@ impl LinuxCapture {
     /// Starts capturing at `edge` of this desktop. Blocks until the portal
     /// session is set up. Events arrive on the returned channel.
     pub fn start(edge: Edge) -> Result<(Self, std_mpsc::Receiver<CaptureEvent>), InputError> {
-        Self::start_with_token(edge, None)
+        Self::start_with_token(vec![edge], None)
     }
 
     /// Like [`LinuxCapture::start`], but on desktops whose portal can
@@ -66,7 +67,7 @@ impl LinuxCapture {
     /// the dialog is skipped, and asks the desktop to remember the answer.
     /// The new token is available from [`LinuxCapture::restore_token`].
     pub fn start_with_token(
-        edge: Edge,
+        edges: Vec<Edge>,
         token: Option<String>,
     ) -> Result<(Self, std_mpsc::Receiver<CaptureEvent>), InputError> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -88,7 +89,7 @@ impl LinuxCapture {
                         return;
                     }
                 };
-                rt.block_on(run(edge, token, rx, events_tx, ready_tx, layout_task));
+                rt.block_on(run(edges, token, rx, events_tx, ready_tx, layout_task));
             })
             .map_err(|e| InputError::Ei(e.to_string()))?;
 
@@ -124,8 +125,14 @@ impl LinuxCapture {
 
     /// Moves the barrier to another screen edge, without a new permission dialog.
     pub fn set_edge(&self, edge: Edge) -> Result<(), InputError> {
+        self.set_edges(vec![edge])
+    }
+
+    /// Puts barriers on these screen edges (one per neighbouring device),
+    /// without a new permission dialog.
+    pub fn set_edges(&self, edges: Vec<Edge>) -> Result<(), InputError> {
         self.tx
-            .send(Command::SetEdge(edge))
+            .send(Command::SetEdges(edges))
             .map_err(|_| InputError::Closed)
     }
 
@@ -154,7 +161,8 @@ fn portal(e: ashpd::Error) -> InputError {
 async fn zones_and_barriers(
     ic: &InputCapture,
     session: &Session<InputCapture>,
-    edge: Edge,
+    edges: &[Edge],
+    ids: &mut HashMap<u32, Edge>,
 ) -> Result<Vec<Rect>, InputError> {
     trace("get zones");
     let zones = ic
@@ -173,10 +181,14 @@ async fn zones_and_barriers(
             h: r.height(),
         })
         .collect();
-    let barriers: Vec<Barrier> = edge_barriers(&rects, edge)
-        .into_iter()
+    ids.clear();
+    let lines = edges
+        .iter()
+        .flat_map(|e| edge_barriers(&rects, *e).into_iter().map(move |l| (*e, l)));
+    let barriers: Vec<Barrier> = lines
         .zip(1u32..)
-        .filter_map(|((x1, y1, x2, y2), id)| {
+        .filter_map(|((e, (x1, y1, x2, y2)), id)| {
+            ids.insert(id, e);
             Some(Barrier::new(
                 NonZeroU32::new(id)?,
                 BarrierPosition::new(x1, y1, x2, y2),
@@ -221,7 +233,7 @@ fn trace(step: &str) {
 }
 
 async fn run(
-    edge: Edge,
+    edges: Vec<Edge>,
     token: Option<String>,
     mut rx: mpsc::UnboundedReceiver<Command>,
     out: std_mpsc::Sender<CaptureEvent>,
@@ -235,6 +247,7 @@ async fn run(
             return;
         }
     };
+    let mut ids: HashMap<u32, Edge> = HashMap::new();
     let setup = async {
         // This step waits for the user to answer GNOME's permission dialog.
         trace("create_session (waiting for the permission dialog)");
@@ -288,7 +301,7 @@ async fn run(
         let deactivated = ic.receive_deactivated().await.map_err(portal)?;
         let disabled = ic.receive_disabled().await.map_err(portal)?;
         let zones_changed = ic.receive_zones_changed().await.map_err(portal)?;
-        let rects = zones_and_barriers(&ic, &session, edge).await?;
+        let rects = zones_and_barriers(&ic, &session, &edges, &mut ids).await?;
         trace("enable");
         ic.enable(&session, EnableOptions::default())
             .await
@@ -332,11 +345,11 @@ async fn run(
     tokio::pin!(events, activated, deactivated, disabled, zones_changed);
 
     let mut translator = Translator::new();
-    // (activation id, position along the edge) while captured.
-    let mut active: Option<(u32, f32)> = None;
+    // (activation id, edge hit, position along it) while captured.
+    let mut active: Option<(u32, Edge, f32)> = None;
 
     let send = |e: CaptureEvent| out.send(e).is_ok();
-    let mut edge = edge;
+    let mut edges = edges;
 
     loop {
         let mut release_now: Option<ReleaseReason> = None;
@@ -344,10 +357,18 @@ async fn run(
         tokio::select! {
             a = activated.next() => {
                 let Some(a) = a else { break };
+                let by_id = match a.barrier_id() {
+                    Some(ActivatedBarrier::Barrier(b)) => ids.get(&b.get()).copied(),
+                    _ => None,
+                };
+                let first = edges.first().copied().unwrap_or(Edge::Right);
+                let edge = by_id
+                    .or_else(|| a.cursor_position().and_then(|c| nearest_edge(&rects, &edges, c)))
+                    .unwrap_or(first);
                 let position = a.cursor_position().map_or(0.5, |c| edge_position(&rects, edge, c));
                 let id = a.activation_id().unwrap_or(0);
-                active = Some((id, position));
-                if !send(CaptureEvent::Activated { position }) { break }
+                active = Some((id, edge, position));
+                if !send(CaptureEvent::Activated { edge, position }) { break }
             }
             d = deactivated.next() => {
                 if d.is_none() { break }
@@ -371,7 +392,7 @@ async fn run(
             }
             z = zones_changed.next() => {
                 if z.is_none() { break }
-                match zones_and_barriers(&ic, &session, edge).await {
+                match zones_and_barriers(&ic, &session, &edges, &mut ids).await {
                     Ok(r) => {
                         rects = r;
                         if let Ok(mut l) = layout.lock() {
@@ -387,10 +408,10 @@ async fn run(
                     release_now = Some(ReleaseReason::Requested);
                     release_pos = pos;
                 }
-                Some(Command::SetEdge(new_edge)) => {
-                    trace("move barrier");
-                    edge = new_edge;
-                    match zones_and_barriers(&ic, &session, edge).await {
+                Some(Command::SetEdges(new_edges)) => {
+                    trace("move barriers");
+                    edges = new_edges;
+                    match zones_and_barriers(&ic, &session, &edges, &mut ids).await {
                         Ok(r) => {
                             rects = r;
                             if let Ok(mut l) = layout.lock() {
@@ -453,7 +474,7 @@ async fn run(
         }
 
         if let Some(reason) = release_now
-            && let Some((id, hit)) = active.take()
+            && let Some((id, edge, hit)) = active.take()
         {
             for ev in translator.release_all() {
                 let _ = send(CaptureEvent::Input(ev));
@@ -470,7 +491,7 @@ async fn run(
     }
 
     // Never leave the user without a cursor: release before tearing down.
-    if let Some((id, position)) = active {
+    if let Some((id, edge, position)) = active {
         let opts = ReleaseOptions::default()
             .set_activation_id(id)
             .set_cursor_position(release_point(&rects, edge, position, RELEASE_INSET));

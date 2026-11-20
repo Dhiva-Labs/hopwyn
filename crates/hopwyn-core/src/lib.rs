@@ -179,7 +179,7 @@ impl Engine {
                 vec![Action::ReleaseCapture { position: None }]
             }
             // Our cursor hit the edge: hand control to the peer.
-            (State::Idle, CaptureEvent::Activated { position }) => {
+            (State::Idle, CaptureEvent::Activated { position, .. }) => {
                 if self.connected {
                     self.state = State::Sending;
                     self.carry = (0.0, 0.0);
@@ -217,7 +217,7 @@ impl Engine {
                 vec![Action::ReleaseCapture { position }]
             }
             // The injected cursor reached our edge: hand control back.
-            (State::Receiving, CaptureEvent::Activated { position }) => {
+            (State::Receiving, CaptureEvent::Activated { position, .. }) => {
                 self.idle_after_handoff(now);
                 vec![
                     Action::Send(Message::Leave),

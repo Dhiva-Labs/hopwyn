@@ -11,7 +11,10 @@ fn engine(edge: Edge, wins_ties: bool) -> Engine {
 }
 
 fn activated(position: f32) -> Input {
-    Input::Capture(CaptureEvent::Activated { position })
+    Input::Capture(CaptureEvent::Activated {
+        edge: Edge::Right,
+        position,
+    })
 }
 
 fn captured(ev: InputEvent) -> Input {

@@ -24,7 +24,7 @@ Then open **Hopwyn** from your app launcher on both computers:
 1. Allow the two desktop permission dialogs (capture input, then remote control). Remote control is asked only once. GNOME 50 and older can't remember the capture permission, so it is asked once each time you log in; Hopwyn keeps running when you close its window so it isn't asked again. Desktops with InputCapture portal version 2 remember it too.
 2. On one computer click **Add computer**; it shows a 6-digit code for 2 minutes.
 3. On the other, pick that computer under **Nearby**, click **Pair…** and type the code.
-4. Choose which side the other screen is on, then move the cursor off that edge.
+4. Choose which side the other screen is on, then move the cursor off that edge. Repeat with **Add computer** for up to 4 computers, one on each side.
 
 **Ctrl+Alt+Esc** always gives your cursor back. The firewall must allow UDP 4242 (link), UDP 5353 (discovery) and, while pairing, TCP 4243 between the computers.
 
@@ -33,14 +33,14 @@ Then open **Hopwyn** from your app launcher on both computers:
 | Version | Scope |
 | --- | --- |
 | v1.0 | Desktop: discovery, pairing, two-way control, active/inactive handoff, layout editor, multi-monitor, clipboard text, hotkeys, tray app, installers |
-| v1.1 | Phones (Android control, iOS remote), clipboard images, file drag-and-drop, groups of up to 4 devices |
+| v1.1 | Phones (Android control, iOS remote), clipboard images, file drag-and-drop, passing the cursor through one computer to the next |
 
 ## Known limitations
 
 - **iOS cannot be controlled from a computer.** Apple does not allow apps to inject input into the system, so an iPhone or iPad can act as a trackpad and keyboard for your computers and share the clipboard and files, but your computer's mouse cannot move onto it. Android does not have this limit.
 - **Linux Wayland** needs a desktop with the InputCapture portal (GNOME 45+, KDE Plasma 6.1+) to send input. Older desktops can still receive input.
 - **Home network only.** Hopwyn refuses connections from public IP addresses and has no relay servers.
-- **One paired computer at a time** in this build; groups of up to 4 come in v1.1.
+- **Up to 4 paired computers**, one beyond each edge of the screen. Each computer's own mouse can reach its neighbours; passing the cursor on through a neighbour to the computer beyond it is not supported yet.
 - **Hidden permission dialogs.** GNOME may open the permission dialogs behind other windows; press the Super key to find them.
 
 ## Repository layout

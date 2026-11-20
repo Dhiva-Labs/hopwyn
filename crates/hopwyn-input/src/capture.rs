@@ -28,10 +28,10 @@ pub type Line = (i32, i32, i32, i32);
 /// What capture reports to the caller.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CaptureEvent {
-    /// The cursor hit the barrier; input now goes to the other device.
-    /// `position` is where along the edge it crossed, 0.0 to 1.0
+    /// The cursor hit the barrier on `edge`; input now goes to the other
+    /// device. `position` is where along the edge it crossed, 0.0 to 1.0
     /// (top to bottom for left/right edges, left to right for top/bottom).
-    Activated { position: f32 },
+    Activated { edge: Edge, position: f32 },
     /// A captured input event to send to the other device.
     Input(InputEvent),
     /// Capture ended and the local cursor is back.
@@ -100,6 +100,22 @@ pub fn edge_barriers(zones: &[Rect], edge: Edge) -> Vec<Line> {
         }
     }
     lines
+}
+
+/// The outer desktop edge nearest to `cursor`, among `edges`.
+#[allow(clippy::cast_precision_loss)]
+pub fn nearest_edge(zones: &[Rect], edges: &[Edge], cursor: (f32, f32)) -> Option<Edge> {
+    let b = bounds(zones)?;
+    let distance = |e: &Edge| match e {
+        Edge::Left => (cursor.0 - b.min_x as f32).abs(),
+        Edge::Right => (b.max_x as f32 - cursor.0).abs(),
+        Edge::Top => (cursor.1 - b.min_y as f32).abs(),
+        Edge::Bottom => (b.max_y as f32 - cursor.1).abs(),
+    };
+    edges
+        .iter()
+        .copied()
+        .min_by(|a, b| distance(a).total_cmp(&distance(b)))
 }
 
 /// Where along `edge` the cursor at `cursor` is, from 0.0 to 1.0.
@@ -228,6 +244,24 @@ impl Translator {
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_edge_picks_the_closest_barrier_edge() {
+        let all = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+        assert_eq!(nearest_edge(&ONE, &all, (1919.0, 500.0)), Some(Edge::Right));
+        assert_eq!(nearest_edge(&ONE, &all, (0.0, 500.0)), Some(Edge::Left));
+        assert_eq!(nearest_edge(&ONE, &all, (900.0, 0.0)), Some(Edge::Top));
+        assert_eq!(
+            nearest_edge(&ONE, &all, (900.0, 1079.0)),
+            Some(Edge::Bottom)
+        );
+        // Only edges that have a neighbour count.
+        assert_eq!(
+            nearest_edge(&ONE, &[Edge::Left, Edge::Top], (1919.0, 5.0)),
+            Some(Edge::Top)
+        );
+        assert_eq!(nearest_edge(&ONE, &[], (0.0, 0.0)), None);
+    }
 
     const ONE: [Rect; 1] = [Rect {
         x: 0,

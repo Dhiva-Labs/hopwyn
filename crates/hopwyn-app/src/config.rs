@@ -2,7 +2,8 @@
 //!
 //! - `identity`: this device's secret key (mode 0600). TEMPORARY until the
 //!   OS key store is wired up, as SECURITY.md notes.
-//! - `partner`: the paired device: key, which edge it sits beyond, its name.
+//! - `partners`: the paired devices, one per line: key, which edge of this
+//!   screen it sits beyond, its name. (Older builds wrote one to `partner`.)
 //! - `restore-token`: the desktop's remote-control permission token (0600),
 //!   so the remote-control dialog is shown once, not on every handoff.
 
@@ -14,7 +15,10 @@ use std::path::{Path, PathBuf};
 use hopwyn_pair::{DeviceId, Identity, MAX_NAME_LEN};
 use hopwyn_proto::Edge;
 
-/// The device this one shares its mouse and keyboard with.
+/// Most devices one computer can be paired with: one beyond each screen edge.
+pub const MAX_PARTNERS: usize = 4;
+
+/// A device this one shares its mouse and keyboard with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Partner {
     pub id: DeviceId,
@@ -64,20 +68,27 @@ impl Store {
         }
     }
 
-    pub fn partner(&self) -> Option<Partner> {
-        let text = fs::read_to_string(self.dir.join("partner")).ok()?;
-        parse_partner(&text)
+    /// The paired devices, at most one per edge. Bad lines are skipped.
+    pub fn partners(&self) -> Vec<Partner> {
+        let text = fs::read_to_string(self.dir.join("partners"))
+            .or_else(|_| fs::read_to_string(self.dir.join("partner")))
+            .unwrap_or_default();
+        let mut out: Vec<Partner> = Vec::new();
+        for p in text.lines().filter_map(parse_partner) {
+            if out.len() < MAX_PARTNERS && !out.iter().any(|q| q.id == p.id || q.edge == p.edge) {
+                out.push(p);
+            }
+        }
+        out
     }
 
-    pub fn save_partner(&self, partner: Option<&Partner>) -> Result<(), String> {
-        let path = self.dir.join("partner");
-        match partner {
-            Some(p) => write_private(&path, format_partner(p).as_bytes()),
-            None => match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.to_string()),
-            },
+    pub fn save_partners(&self, partners: &[Partner]) -> Result<(), String> {
+        let text: String = partners.iter().map(format_partner).collect();
+        write_private(&self.dir.join("partners"), text.as_bytes())?;
+        match fs::remove_file(self.dir.join("partner")) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -185,8 +196,7 @@ fn format_partner(p: &Partner) -> String {
     )
 }
 
-fn parse_partner(text: &str) -> Option<Partner> {
-    let line = text.lines().next()?;
+fn parse_partner(line: &str) -> Option<Partner> {
     let mut parts = line.splitn(3, ' ');
     let id = parse_hex_id(parts.next()?)?;
     let edge = parse_edge(parts.next()?)?;
@@ -245,27 +255,50 @@ mod tests {
         assert!(s.identity("Desk").is_err());
     }
 
-    #[test]
-    fn partner_round_trips_and_forgets() {
-        let s = temp_store();
-        assert_eq!(s.partner(), None);
-        let p = Partner {
+    fn partner(name: &str, edge: Edge) -> Partner {
+        Partner {
             id: Identity::generate("x").id(),
-            name: "Living room PC".into(),
-            edge: Edge::Left,
-        };
-        s.save_partner(Some(&p)).unwrap();
-        assert_eq!(s.partner(), Some(p));
-        s.save_partner(None).unwrap();
-        assert_eq!(s.partner(), None);
-        s.save_partner(None).unwrap();
+            name: name.into(),
+            edge,
+        }
     }
 
     #[test]
-    fn corrupt_partner_file_is_ignored() {
+    fn partners_round_trip_and_forget() {
         let s = temp_store();
-        write_private(&s.dir.join("partner"), b"nonsense here").unwrap();
-        assert_eq!(s.partner(), None);
+        assert!(s.partners().is_empty());
+        let list = vec![
+            partner("Living room PC", Edge::Left),
+            partner("Laptop", Edge::Top),
+        ];
+        s.save_partners(&list).unwrap();
+        assert_eq!(s.partners(), list);
+        s.save_partners(&[]).unwrap();
+        assert!(s.partners().is_empty());
+    }
+
+    #[test]
+    fn old_single_partner_file_is_read_and_replaced() {
+        let s = temp_store();
+        let p = partner("Desk", Edge::Right);
+        write_private(&s.dir.join("partner"), format_partner(&p).as_bytes()).unwrap();
+        assert_eq!(s.partners(), vec![p.clone()]);
+        s.save_partners(std::slice::from_ref(&p)).unwrap();
+        assert!(!s.dir.join("partner").exists());
+        assert_eq!(s.partners(), vec![p]);
+    }
+
+    #[test]
+    fn duplicate_edges_and_bad_lines_are_skipped() {
+        let s = temp_store();
+        let (a, b) = (partner("A", Edge::Left), partner("B", Edge::Left));
+        let text = format!(
+            "{}nonsense here\n{}",
+            format_partner(&a),
+            format_partner(&b)
+        );
+        write_private(&s.dir.join("partners"), text.as_bytes()).unwrap();
+        assert_eq!(s.partners(), vec![a]);
     }
 
     #[test]

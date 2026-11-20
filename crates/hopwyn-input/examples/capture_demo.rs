@@ -40,7 +40,7 @@ fn main() {
             captured_since = None;
         }
         match events.recv_timeout(Duration::from_millis(100)) {
-            Ok(CaptureEvent::Activated { position }) => {
+            Ok(CaptureEvent::Activated { position, .. }) => {
                 println!(
                     "Captured at {:.0}% down the edge. Move, click, type; releasing in 5 s (or Ctrl+Alt+Esc).",
                     position * 100.0

@@ -9,8 +9,10 @@ use gtk::glib;
 use hopwyn_proto::Edge;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::config::MAX_PARTNERS;
 use crate::config::Partner;
-use crate::service::{self, Command, Control, Link, Nearby, UiEvent};
+use crate::service::{self, Command, Control, Nearby, UiEvent};
+use hopwyn_pair::DeviceId;
 
 pub const APP_ID: &str = "app.hopwyn.Hopwyn";
 
@@ -26,6 +28,11 @@ const CSS: &str = "
 .status-card image { color: @accent_color; }
 .status-card.inactive image { color: @warning_color; }
 .status-card.problem image { color: @error_color; }
+.layout-tile { padding: 10px 12px; border-radius: 10px; min-width: 96px; min-height: 52px; }
+.layout-tile.this { background: alpha(@accent_bg_color, 0.85); color: @accent_fg_color; font-weight: 700; }
+.layout-tile.peer { background: alpha(@card_fg_color, 0.08); }
+.layout-tile.peer.online { background: alpha(@success_color, 0.18); }
+.layout-tile.peer.active { background: alpha(@warning_color, 0.30); }
 .pairing-code { font-size: 44px; font-weight: 800; letter-spacing: 6px; font-feature-settings: 'tnum'; }
 ";
 
@@ -98,20 +105,20 @@ struct Ui {
     status_title: gtk::Label,
     status_text: gtk::Label,
     partner_group: adw::PreferencesGroup,
-    partner_row: adw::ActionRow,
-    side_row: adw::ComboRow,
-    forget_button: gtk::Button,
+    layout: gtk::Grid,
+    /// Left, right, top, bottom.
+    layout_tiles: [gtk::Label; 4],
+    partner_rows: RefCell<Vec<(DeviceId, adw::ComboRow)>>,
     empty_row: adw::ActionRow,
     nearby_group: adw::PreferencesGroup,
     nearby_empty: adw::ActionRow,
     nearby_rows: RefCell<Vec<adw::ActionRow>>,
     code_dialog: RefCell<Option<adw::AlertDialog>>,
     cmd: UnboundedSender<Command>,
-    partner: RefCell<Option<Partner>>,
-    status: RefCell<(Link, Control)>,
+    partners: RefCell<Vec<Partner>>,
+    status: RefCell<(Vec<DeviceId>, Control)>,
     ready: Cell<bool>,
     failed: Cell<bool>,
-    updating_side: Cell<bool>,
 }
 
 fn build(app: &adw::Application) -> adw::ApplicationWindow {
@@ -181,22 +188,53 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
     card.append(&status_title);
     card.append(&status_text);
 
-    // Paired device.
+    // Paired computers, with a picture of where each one sits.
     let partner_group = adw::PreferencesGroup::builder()
-        .title("Paired computer")
+        .title("Paired computers")
+        .description(format!(
+            "Up to {MAX_PARTNERS}, one on each side of this screen. Pick the side each one is on."
+        ))
         .build();
-    let partner_row = adw::ActionRow::builder().title("—").build();
-    partner_row.add_prefix(&gtk::Image::from_icon_name("computer-symbolic"));
-    let forget_button = gtk::Button::builder()
-        .label("Forget")
-        .valign(gtk::Align::Center)
-        .css_classes(["destructive-action", "flat"])
+    let layout = gtk::Grid::builder()
+        .row_spacing(8)
+        .column_spacing(8)
+        .halign(gtk::Align::Center)
+        .margin_bottom(12)
         .build();
-    partner_row.add_suffix(&forget_button);
-    let side_row = adw::ComboRow::builder()
-        .title("Its screen is")
-        .model(&gtk::StringList::new(&SIDES))
-        .build();
+    let tile = |text: &str, classes: &[&str]| {
+        let l = gtk::Label::builder()
+            .label(text)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .max_width_chars(12)
+            .build();
+        l.add_css_class("layout-tile");
+        for c in classes {
+            l.add_css_class(c);
+        }
+        l
+    };
+    layout.attach(&tile("This computer", &["this"]), 1, 1, 1, 1);
+    let layout_tiles: [gtk::Label; 4] = [
+        tile("", &["peer"]),
+        tile("", &["peer"]),
+        tile("", &["peer"]),
+        tile("", &["peer"]),
+    ];
+    for (edge, t) in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+        .into_iter()
+        .zip(layout_tiles.iter())
+    {
+        let (col, row) = match edge {
+            Edge::Left => (0, 1),
+            Edge::Right => (2, 1),
+            Edge::Top => (1, 0),
+            Edge::Bottom => (1, 2),
+        };
+        layout.attach(t, col, row, 1, 1);
+    }
+    layout.set_visible(false);
+    partner_group.add(&layout);
     let empty_row = adw::ActionRow::builder()
         .title("No computer paired yet")
         .subtitle("Pair one under Nearby, or show a code with Add computer")
@@ -297,41 +335,24 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         status_title,
         status_text,
         partner_group,
-        partner_row,
-        side_row,
-        forget_button,
+        layout,
+        layout_tiles,
+        partner_rows: RefCell::new(Vec::new()),
         empty_row,
         nearby_group,
         nearby_empty,
         nearby_rows: RefCell::new(Vec::new()),
         code_dialog: RefCell::new(None),
         cmd,
-        partner: RefCell::new(None),
-        status: RefCell::new((Link::NoPartner, Control::Local)),
+        partners: RefCell::new(Vec::new()),
+        status: RefCell::new((Vec::new(), Control::Local)),
         ready: Cell::new(false),
         failed: Cell::new(false),
-        updating_side: Cell::new(false),
     });
 
     {
         let ui2 = ui.clone();
         add_button.connect_clicked(move |_| ui2.show_code_dialog());
-    }
-    {
-        let ui2 = ui.clone();
-        ui.forget_button
-            .connect_clicked(move |_| ui2.confirm_forget());
-    }
-    {
-        let ui2 = ui.clone();
-        ui.side_row.connect_selected_notify(move |row| {
-            if ui2.updating_side.get() {
-                return;
-            }
-            if let Some(edge) = index_edge(row.selected()) {
-                let _ = ui2.cmd.send(Command::SetEdge(edge));
-            }
-        });
     }
     {
         let ui2 = ui.clone();
@@ -381,13 +402,14 @@ impl Ui {
                 self.ready.set(true);
                 self.refresh_card();
             }
-            UiEvent::Status { link, control } => {
-                *self.status.borrow_mut() = (link, control);
+            UiEvent::Status { connected, control } => {
+                *self.status.borrow_mut() = (connected, control);
                 self.refresh_card();
+                self.refresh_partner_status();
             }
-            UiEvent::Partner(p) => {
-                *self.partner.borrow_mut() = p;
-                self.refresh_partner();
+            UiEvent::Partners(list) => {
+                *self.partners.borrow_mut() = list;
+                self.refresh_partners();
                 self.refresh_card();
             }
             UiEvent::Nearby(list) => self.refresh_nearby(&list),
@@ -428,13 +450,22 @@ impl Ui {
         }
     }
 
+    fn partner_name(&self, id: &DeviceId) -> String {
+        self.partners
+            .borrow()
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "the other computer".into())
+    }
+
     fn refresh_card(&self) {
         if !self.ready.get() {
             return;
         }
-        let partner = self.partner.borrow();
-        let (link, control) = self.status.borrow().clone();
-        let Some(p) = partner.as_ref() else {
+        let partners = self.partners.borrow().clone();
+        let (connected, control) = self.status.borrow().clone();
+        if partners.is_empty() {
             self.set_card(
                 "computer-symbolic",
                 "No computer paired",
@@ -442,77 +473,132 @@ impl Ui {
                 "",
             );
             return;
-        };
-        match (link, control) {
-            (Link::Connected, Control::ControllingPartner) => self.set_card(
+        }
+        match control {
+            Control::Controlling(id) => self.set_card(
                 "go-next-symbolic",
-                &format!("Controlling {}", p.name),
+                &format!("Controlling {}", self.partner_name(&id)),
                 "This computer is inactive while its mouse and keyboard drive the other one.",
                 "inactive",
             ),
-            (Link::Connected, Control::ControlledByPartner) => self.set_card(
-                "go-previous-symbolic",
-                &format!("Controlled by {}", p.name),
-                &format!("{}'s mouse and keyboard are driving this computer.", p.name),
-                "",
-            ),
-            (Link::Connected, Control::Local) => self.set_card(
-                "input-mouse-symbolic",
-                "Ready",
-                &format!(
-                    "Move the cursor off the {} edge to use {}.",
-                    edge_words(p.edge),
-                    p.name
-                ),
-                "",
-            ),
-            _ => self.set_card(
-                "network-wireless-symbolic",
-                &format!("Looking for {}", p.name),
-                "Make sure Hopwyn is open on it and both are on the same network.",
-                "",
-            ),
+            Control::ControlledBy(id) => {
+                let name = self.partner_name(&id);
+                self.set_card(
+                    "go-previous-symbolic",
+                    &format!("Controlled by {name}"),
+                    &format!("{name}'s mouse and keyboard are driving this computer."),
+                    "",
+                );
+            }
+            Control::Local => {
+                let online: Vec<String> = partners
+                    .iter()
+                    .filter(|p| connected.contains(&p.id))
+                    .map(|p| format!("the {} edge for {}", edge_words(p.edge), p.name))
+                    .collect();
+                if online.is_empty() {
+                    let names: Vec<&str> = partners.iter().map(|p| p.name.as_str()).collect();
+                    self.set_card(
+                        "network-wireless-symbolic",
+                        &format!("Looking for {}", join_words(&names)),
+                        "Make sure Hopwyn is open on them and all are on the same network.",
+                        "",
+                    );
+                } else {
+                    let refs: Vec<&str> = online.iter().map(String::as_str).collect();
+                    self.set_card(
+                        "input-mouse-symbolic",
+                        "Ready",
+                        &format!("Move the cursor off {}.", join_words(&refs)),
+                        "",
+                    );
+                }
+            }
         }
-        drop(partner);
-        self.refresh_partner_subtitle();
     }
 
-    fn refresh_partner_subtitle(&self) {
-        let partner = self.partner.borrow();
-        if let Some(p) = partner.as_ref() {
-            let state = match self.status.borrow().0 {
-                Link::Connected => "Connected",
-                _ => "Not connected",
+    /// Updates each paired computer's subtitle and the layout picture.
+    fn refresh_partner_status(&self) {
+        let (connected, control) = self.status.borrow().clone();
+        let partners = self.partners.borrow();
+        for (id, row) in self.partner_rows.borrow().iter() {
+            let active =
+                matches!(control, Control::Controlling(c) | Control::ControlledBy(c) if c == *id);
+            let state = if active {
+                "In use"
+            } else if connected.contains(id) {
+                "Connected"
+            } else {
+                "Not connected"
             };
-            self.partner_row
-                .set_subtitle(&format!("{state} · {} side", edge_words(p.edge)));
+            row.set_subtitle(state);
         }
+        for (edge, tile) in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+            .into_iter()
+            .zip(self.layout_tiles.iter())
+        {
+            let p = partners.iter().find(|p| p.edge == edge);
+            tile.set_visible(p.is_some());
+            tile.remove_css_class("online");
+            tile.remove_css_class("active");
+            if let Some(p) = p {
+                tile.set_label(&p.name);
+                let active = matches!(control, Control::Controlling(c) | Control::ControlledBy(c) if c == p.id);
+                if active {
+                    tile.add_css_class("active");
+                } else if connected.contains(&p.id) {
+                    tile.add_css_class("online");
+                }
+            }
+        }
+        self.layout.set_visible(!partners.is_empty());
     }
 
-    fn refresh_partner(&self) {
-        let partner = self.partner.borrow().clone();
-        // Rebuild the group's rows for the current state.
-        for row in [
-            self.empty_row.upcast_ref::<gtk::Widget>(),
-            self.partner_row.upcast_ref(),
-            self.side_row.upcast_ref(),
-        ] {
-            if row.parent().is_some() {
-                self.partner_group.remove(row);
-            }
+    /// Rebuilds one row per paired computer.
+    fn refresh_partners(self: &Rc<Self>) {
+        for (_, row) in self.partner_rows.borrow_mut().drain(..) {
+            self.partner_group.remove(&row);
         }
-        match partner {
-            Some(p) => {
-                self.partner_row.set_title(&p.name);
-                self.updating_side.set(true);
-                self.side_row.set_selected(edge_index(p.edge));
-                self.updating_side.set(false);
-                self.partner_group.add(&self.partner_row);
-                self.partner_group.add(&self.side_row);
-                self.refresh_partner_subtitle();
-            }
-            None => self.partner_group.add(&self.empty_row),
+        if self.empty_row.parent().is_some() {
+            self.partner_group.remove(&self.empty_row);
         }
+        let partners = self.partners.borrow().clone();
+        if partners.is_empty() {
+            self.partner_group.add(&self.empty_row);
+        }
+        for p in partners {
+            let row = adw::ComboRow::builder()
+                .title(&p.name)
+                .model(&gtk::StringList::new(&SIDES))
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name("computer-symbolic"));
+            row.set_selected(edge_index(p.edge));
+            let forget = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .tooltip_text(format!("Forget {}", p.name))
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            row.add_suffix(&forget);
+            {
+                let ui = self.clone();
+                let (id, name) = (p.id, p.name.clone());
+                forget.connect_clicked(move |_| ui.confirm_forget(id, &name));
+            }
+            {
+                // Connected after set_selected, so building the row sends nothing.
+                let ui = self.clone();
+                let id = p.id;
+                row.connect_selected_notify(move |row| {
+                    if let Some(edge) = index_edge(row.selected()) {
+                        let _ = ui.cmd.send(Command::SetEdge { id, edge });
+                    }
+                });
+            }
+            self.partner_group.add(&row);
+            self.partner_rows.borrow_mut().push((p.id, row));
+        }
+        self.refresh_partner_status();
     }
 
     fn refresh_nearby(self: &Rc<Self>, list: &[Nearby]) {
@@ -560,23 +646,8 @@ impl Ui {
         if !self.check_ready() {
             return;
         }
-        if self.partner.borrow().is_some() {
-            let dialog = adw::AlertDialog::new(
-                Some("Replace the paired computer?"),
-                Some(
-                    "Hopwyn shares with one computer at a time. Pairing a new one replaces the current one.",
-                ),
-            );
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("continue", "Continue");
-            dialog.set_close_response("cancel");
-            let ui = self.clone();
-            dialog.connect_response(None, move |_, response| {
-                if response == "continue" {
-                    let _ = ui.cmd.send(Command::AddDevice);
-                }
-            });
-            dialog.present(Some(&self.window));
+        if self.partners.borrow().len() >= MAX_PARTNERS {
+            self.toast("Hopwyn is paired with 4 computers, one on each side. Forget one first");
             return;
         }
         let _ = self.cmd.send(Command::AddDevice);
@@ -678,13 +749,7 @@ impl Ui {
         entry.grab_focus();
     }
 
-    fn confirm_forget(self: &Rc<Self>) {
-        let name = self
-            .partner
-            .borrow()
-            .as_ref()
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
+    fn confirm_forget(self: &Rc<Self>, id: DeviceId, name: &str) {
         let dialog = adw::AlertDialog::new(
             Some(&format!("Forget {name}?")),
             Some("It will no longer be able to connect. You can pair again later."),
@@ -696,9 +761,18 @@ impl Ui {
         let ui = self.clone();
         dialog.connect_response(None, move |_, response| {
             if response == "forget" {
-                let _ = ui.cmd.send(Command::Forget);
+                let _ = ui.cmd.send(Command::Forget(id));
             }
         });
         dialog.present(Some(&self.window));
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_words(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
