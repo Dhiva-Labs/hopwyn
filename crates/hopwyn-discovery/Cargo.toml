@@ -1,0 +1,16 @@
+[package]
+name = "hopwyn-discovery"
+description = "Finds other Hopwyn devices on the home network over mDNS / DNS-SD"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+hopwyn-pair = { path = "../hopwyn-pair" }
+hopwyn-transport = { path = "../hopwyn-transport" }
+mdns-sd = { version = "0.22", default-features = false }

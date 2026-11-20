@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Hopwyn
+GenericName=Mouse and Keyboard Sharing
+Comment=One mouse and keyboard for every computer in your home
+Exec=hopwyn-app
+Icon=app.hopwyn.Hopwyn
+Terminal=false
+Categories=Utility;
+Keywords=mouse;keyboard;share;kvm;screens;
+StartupNotify=true
+StartupWMClass=app.hopwyn.Hopwyn

@@ -1,0 +1,13 @@
+[package]
+name = "hopwyn-proto"
+description = "Wire protocol for Hopwyn: message types and a bounded binary encoding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

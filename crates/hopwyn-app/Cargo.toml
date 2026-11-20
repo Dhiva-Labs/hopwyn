@@ -1,0 +1,32 @@
+[package]
+name = "hopwyn-app"
+description = "Hopwyn desktop app: one mouse and keyboard for every computer in your home"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "hopwyn-app"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+hopwyn-core = { path = "../hopwyn-core" }
+hopwyn-discovery = { path = "../hopwyn-discovery" }
+hopwyn-input = { path = "../hopwyn-input" }
+hopwyn-pair = { path = "../hopwyn-pair" }
+hopwyn-proto = { path = "../hopwyn-proto" }
+hopwyn-transport = { path = "../hopwyn-transport" }
+async-channel = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { package = "gtk4", version = "0.9" }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

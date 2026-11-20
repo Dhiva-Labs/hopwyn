@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Hopwyn</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4C8DFF"/>
+      <stop offset="1" stop-color="#2C62E0"/>
+    </linearGradient>
+  </defs>
+  <!-- Tile -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <!-- Back screen (the other computer) -->
+  <rect x="60" y="40" width="48" height="34" rx="6" fill="#CFE0FF"/>
+  <rect x="64" y="44" width="40" height="26" rx="3" fill="#8FB4FF"/>
+  <rect x="80" y="74" width="8" height="8" fill="#CFE0FF"/>
+  <rect x="72" y="82" width="24" height="4" rx="2" fill="#CFE0FF"/>
+  <!-- Front screen (this computer) -->
+  <rect x="20" y="30" width="52" height="38" rx="6" fill="#FFFFFF"/>
+  <rect x="24" y="34" width="44" height="30" rx="3" fill="#DCE8FF"/>
+  <rect x="42" y="68" width="8" height="10" fill="#FFFFFF"/>
+  <rect x="32" y="78" width="28" height="4" rx="2" fill="#FFFFFF"/>
+  <!-- Hop: a dotted arc from one screen to the other -->
+  <path d="M42 24 C 52 6, 78 6, 88 34" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" stroke-dasharray="1 8"/>
+  <!-- Cursor landing on the other screen -->
+  <path d="M84 48 L84 74 L90 68 L95 79 L100 77 L95 66 L103 66 Z" fill="#FFFFFF" stroke="#1E3F99" stroke-width="2.5" stroke-linejoin="round"/>
+</svg>

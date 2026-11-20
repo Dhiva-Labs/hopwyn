@@ -1,0 +1,24 @@
+[package]
+name = "hopwyn-transport"
+description = "Encrypted QUIC transport for Hopwyn with pinned device keys and a home-network-only policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+hopwyn-pair = { path = "../hopwyn-pair" }
+hopwyn-proto = { path = "../hopwyn-proto" }
+ed25519-dalek = { version = "2.1", features = ["pkcs8", "alloc", "zeroize"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["time"] }
+zeroize = "1.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

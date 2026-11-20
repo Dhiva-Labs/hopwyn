@@ -1,0 +1,24 @@
+[package]
+name = "hopwyn-input"
+description = "Input events for Hopwyn and per-OS injection backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+hopwyn-proto = { path = "../hopwyn-proto" }
+
+[dev-dependencies]
+hopwyn-proto = { path = "../hopwyn-proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast", "input_capture"] }
+futures-util = { version = "0.3", default-features = false }
+reis = { version = "0.5", features = ["tokio"] }
+rustix = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }

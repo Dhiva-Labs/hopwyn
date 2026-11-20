@@ -1,0 +1,15 @@
+[package]
+name = "hopwyn-core"
+description = "Edge handoff state machine for Hopwyn: who is active, and what to send or inject"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+hopwyn-input = { path = "../hopwyn-input" }
+hopwyn-proto = { path = "../hopwyn-proto" }
