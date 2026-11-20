@@ -11,6 +11,22 @@ One mouse and keyboard for every computer and phone in your home. Move the curso
 
 ## Install (Linux)
 
+From the Dhiva-Labs PPA (Ubuntu 26.04):
+
+```bash
+sudo add-apt-repository ppa:dhiva-labs/apps
+sudo apt install hopwyn
+```
+
+Or from the Snap Store (developer preview on the edge channel):
+
+```bash
+sudo snap install hopwyn --edge
+```
+
+### From source
+
+
 Requires Rust 1.88+ and the GTK 4 / libadwaita development files (`sudo apt install libgtk-4-dev libadwaita-1-dev` on Ubuntu).
 
 ```bash

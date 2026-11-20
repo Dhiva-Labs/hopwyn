@@ -1,0 +1,17 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: hopwyn
+Source: https://github.com/Dhiva-Labs/hopwyn
+
+Files: *
+Copyright: 2026 Dhiva-Labs
+License: Apache-2.0
+
+Files: vendor/*
+Copyright: The authors of each vendored Rust crate; see each crate's own
+ license file and Cargo.toml.
+License: various
+ Each crate under vendor/ carries its own license (MIT, Apache-2.0 and
+ compatible licenses), as recorded in its Cargo.toml.
+
+License: Apache-2.0
+ On Debian systems, the full text is in /usr/share/common-licenses/Apache-2.0.

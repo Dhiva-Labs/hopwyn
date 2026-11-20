@@ -3,3 +3,13 @@
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/Cargo.lock
+/*.snap
+/parts
+/stage
+/prime
+/debian/cargo-home
+/debian/hopwyn
+/debian/.debhelper
+/debian/files
+/debian/*.substvars
+/debian/debhelper-build-stamp

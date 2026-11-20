@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+# Builds offline from the crates vendored into the source package.
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home
+
+# Vendored crates ship Cargo.toml.orig files that their checksums cover;
+# dh_clean would delete them as editor leftovers.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build --release --offline --frozen -p hopwyn-app
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -Dm755 target/release/hopwyn-app debian/hopwyn/usr/bin/hopwyn-app
+	install -Dm644 crates/hopwyn-app/data/app.hopwyn.Hopwyn.desktop \
+		debian/hopwyn/usr/share/applications/app.hopwyn.Hopwyn.desktop
+	install -Dm644 crates/hopwyn-app/data/icons/hicolor/scalable/apps/app.hopwyn.Hopwyn.svg \
+		debian/hopwyn/usr/share/icons/hicolor/scalable/apps/app.hopwyn.Hopwyn.svg

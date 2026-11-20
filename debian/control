@@ -1,0 +1,29 @@
+Source: hopwyn
+Section: utils
+Priority: optional
+Maintainer: Dhivakar R (Dhiva-Labs) <dhivakar1010@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo (>= 1.88),
+               rustc (>= 1.88),
+               pkgconf,
+               libgtk-4-dev,
+               libadwaita-1-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/Dhiva-Labs/hopwyn
+Vcs-Browser: https://github.com/Dhiva-Labs/hopwyn
+Vcs-Git: https://github.com/Dhiva-Labs/hopwyn.git
+Rules-Requires-Root: no
+
+Package: hopwyn
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, xdg-desktop-portal
+Recommends: xdg-desktop-portal-gnome | xdg-desktop-portal-kde
+Description: one mouse and keyboard for every computer in your home
+ Move the cursor off the edge of one screen and it appears on the next;
+ the computer you left goes inactive and the one you entered becomes
+ active. Pair by clicking Add computer on one and Pair on both, with up to
+ four computers arranged around the screen.
+ .
+ No account and no cloud: everything stays on the home network, encrypted
+ with TLS 1.3 and pinned device keys. Needs a desktop with the
+ InputCapture portal (GNOME 45+, KDE Plasma 6.1+). Developer preview.

@@ -1,0 +1,57 @@
+name: hopwyn
+base: core24
+adopt-info: hopwyn
+summary: One mouse and keyboard for every computer in your home
+description: |
+  Move the cursor off the edge of one screen and it appears on the next.
+  The computer you left goes inactive; the one you entered becomes active.
+
+  - Pair by clicking Add computer on one and Pair on both; nothing to type.
+  - Up to 4 computers, one on each side of the screen; drag to arrange.
+  - Private: no account, no cloud. Everything stays on your home network,
+    encrypted with TLS 1.3 and pinned device keys.
+
+  Developer preview for Linux (GNOME 45+ or KDE Plasma 6.1+ on Wayland,
+  which provide the InputCapture portal). Ctrl+Alt+Esc always gives your
+  cursor back.
+grade: devel
+confinement: strict
+license: Apache-2.0
+website: https://github.com/Dhiva-Labs/hopwyn
+source-code: https://github.com/Dhiva-Labs/hopwyn
+issues: https://github.com/Dhiva-Labs/hopwyn/issues
+
+apps:
+  hopwyn:
+    command: bin/hopwyn-app
+    desktop: share/applications/app.hopwyn.Hopwyn.desktop
+    common-id: app.hopwyn.Hopwyn
+    extensions: [gnome]
+    plugs:
+      - network
+      - network-bind
+      - desktop
+      - wayland
+      - x11
+
+parts:
+  hopwyn:
+    plugin: rust
+    source: .
+    rust-channel: "1.93"
+    rust-path: [crates/hopwyn-app]
+    build-packages:
+      - pkg-config
+      - libgtk-4-dev
+      - libadwaita-1-dev
+    override-pull: |
+      craftctl default
+      craftctl set version="$(git describe --tags --always 2>/dev/null || echo 0.1.0)"
+    override-build: |
+      craftctl default
+      install -Dm644 crates/hopwyn-app/data/app.hopwyn.Hopwyn.desktop \
+        "$CRAFT_PART_INSTALL/share/applications/app.hopwyn.Hopwyn.desktop"
+      sed -i 's|^Icon=.*|Icon=${SNAP}/share/icons/hicolor/scalable/apps/app.hopwyn.Hopwyn.svg|' \
+        "$CRAFT_PART_INSTALL/share/applications/app.hopwyn.Hopwyn.desktop"
+      install -Dm644 crates/hopwyn-app/data/icons/hicolor/scalable/apps/app.hopwyn.Hopwyn.svg \
+        "$CRAFT_PART_INSTALL/share/icons/hicolor/scalable/apps/app.hopwyn.Hopwyn.svg"
