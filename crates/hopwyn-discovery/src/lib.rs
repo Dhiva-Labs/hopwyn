@@ -52,10 +52,19 @@ fn err(e: impl std::fmt::Display) -> DiscoveryError {
     DiscoveryError(e.to_string())
 }
 
+/// DNS-SD service type announced only while "Add computer" is open. A
+/// separate, short-lived service (rather than a changed TXT record) so
+/// other devices notice at once: peers may keep a cached TXT record.
+pub const PAIR_SERVICE_TYPE: &str = "_hopwyn-pair._tcp.local.";
+
 /// Announces this device and reports others. Stops on drop.
 pub struct Discovery {
     daemon: ServiceDaemon,
     fullname: String,
+    instance: String,
+    host: String,
+    id_hex: String,
+    pairing: Option<String>,
 }
 
 impl Discovery {
@@ -70,9 +79,10 @@ impl Discovery {
 
         let instance = instance_name(&self_id);
         let host = format!("{instance}.local.");
+        let id_hex = parse::hex(self_id.as_bytes());
         let mut txt = HashMap::new();
         txt.insert("v".to_owned(), TXT_VERSION.to_owned());
-        txt.insert("id".to_owned(), parse::hex(self_id.as_bytes()));
+        txt.insert("id".to_owned(), id_hex.clone());
         txt.insert("name".to_owned(), identity.name().to_owned());
 
         let info = ServiceInfo::new(SERVICE_TYPE, &instance, &host, (), port, txt)
@@ -81,36 +91,113 @@ impl Discovery {
         let fullname = info.get_fullname().to_owned();
         daemon.register(info).map_err(err)?;
 
-        let events = daemon.browse(SERVICE_TYPE).map_err(err)?;
+        // Both browsers feed one channel, so one thread keeps the state.
+        let (raw_tx, raw_rx) = mpsc::channel::<(Kind, ServiceEvent)>();
+        for (kind, ty) in [
+            (Kind::Device, SERVICE_TYPE),
+            (Kind::Pairing, PAIR_SERVICE_TYPE),
+        ] {
+            let events = daemon.browse(ty).map_err(err)?;
+            let raw_tx = raw_tx.clone();
+            thread::Builder::new()
+                .name("hopwyn-browse".into())
+                .spawn(move || {
+                    while let Ok(e) = events.recv() {
+                        if raw_tx.send((kind, e)).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .map_err(err)?;
+        }
+        drop(raw_tx);
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
             .name("hopwyn-discovery".into())
-            .spawn(move || pump(&events, &tx, self_id))
+            .spawn(move || pump(&raw_rx, &tx, self_id))
             .map_err(err)?;
 
-        Ok((Self { daemon, fullname }, rx))
+        Ok((
+            Self {
+                daemon,
+                fullname,
+                instance,
+                host,
+                id_hex,
+                pairing: None,
+            },
+            rx,
+        ))
+    }
+
+    /// Announces that this device has "Add computer" open, pairing on TCP
+    /// `port` (`Some(token)`: 1 to 16 lowercase hex digits, new for each
+    /// window), or closed (`None`). Other devices see it in
+    /// [`DiscoveredDevice::pairing`] and [`DiscoveredDevice::pairing_port`].
+    pub fn set_pairing(&mut self, token: Option<&str>, port: u16) -> Result<(), DiscoveryError> {
+        let fullname = format!("{}.{PAIR_SERVICE_TYPE}", self.instance);
+        if self.pairing.take().is_some() {
+            let _ = self.daemon.unregister(&fullname);
+        }
+        let Some(t) = token else {
+            return Ok(());
+        };
+        if parse::pairing_token(Some(t)).is_none() {
+            return Err(DiscoveryError("bad pairing token".into()));
+        }
+        let mut txt = HashMap::new();
+        txt.insert("v".to_owned(), TXT_VERSION.to_owned());
+        txt.insert("id".to_owned(), self.id_hex.clone());
+        txt.insert("t".to_owned(), t.to_owned());
+        let info = ServiceInfo::new(PAIR_SERVICE_TYPE, &self.instance, &self.host, (), port, txt)
+            .map_err(err)?
+            .enable_addr_auto();
+        self.daemon.register(info).map_err(err)?;
+        self.pairing = Some(t.to_owned());
+        Ok(())
     }
 }
 
 impl Drop for Discovery {
     fn drop(&mut self) {
         // Best effort: say goodbye so peers drop us quickly, then stop.
+        if self.pairing.is_some() {
+            let _ = self
+                .daemon
+                .unregister(&format!("{}.{PAIR_SERVICE_TYPE}", self.instance));
+        }
         let _ = self.daemon.unregister(&self.fullname);
         let _ = self.daemon.shutdown();
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Device,
+    Pairing,
+}
+
 /// Turns raw mDNS events into validated discovery events. Ends when either
 /// side of the channel goes away.
 fn pump(
-    events: &mdns_sd::Receiver<ServiceEvent>,
+    events: &mpsc::Receiver<(Kind, ServiceEvent)>,
     tx: &mpsc::Sender<DiscoveryEvent>,
     self_id: DeviceId,
 ) {
-    let mut known: HashMap<String, DeviceId> = HashMap::new();
-    while let Ok(event) = events.recv() {
-        let out = match event {
-            ServiceEvent::ServiceResolved(svc) => {
+    let mut devices: HashMap<String, DiscoveredDevice> = HashMap::new();
+    // Open pairing windows: device -> (token, port), and fullname -> device.
+    let mut open: HashMap<DeviceId, (String, u16)> = HashMap::new();
+    let mut open_names: HashMap<String, DeviceId> = HashMap::new();
+    let with_pairing = |mut d: DiscoveredDevice, open: &HashMap<DeviceId, (String, u16)>| {
+        if let Some((t, p)) = open.get(&d.id) {
+            d.pairing = Some(t.clone());
+            d.pairing_port = Some(*p);
+        }
+        d
+    };
+    while let Ok((kind, event)) = events.recv() {
+        let out = match (kind, event) {
+            (Kind::Device, ServiceEvent::ServiceResolved(svc)) => {
                 let addrs: Vec<SocketAddr> = svc
                     .get_addresses()
                     .iter()
@@ -125,15 +212,46 @@ fn pump(
                     self_id,
                 );
                 match device {
-                    Some(d) if known.contains_key(&svc.fullname) || known.len() < MAX_TRACKED => {
-                        known.insert(svc.fullname.clone(), d.id);
-                        Some(DiscoveryEvent::Found(d))
+                    Some(d)
+                        if devices.contains_key(&svc.fullname) || devices.len() < MAX_TRACKED =>
+                    {
+                        devices.insert(svc.fullname.clone(), d.clone());
+                        Some(DiscoveryEvent::Found(with_pairing(d, &open)))
                     }
                     _ => None,
                 }
             }
-            ServiceEvent::ServiceRemoved(_, fullname) => {
-                known.remove(&fullname).map(DiscoveryEvent::Lost)
+            (Kind::Device, ServiceEvent::ServiceRemoved(_, fullname)) => devices
+                .remove(&fullname)
+                .map(|d| DiscoveryEvent::Lost(d.id)),
+            (Kind::Pairing, ServiceEvent::ServiceResolved(svc)) => {
+                let id = parse::pairing_owner(
+                    &svc.fullname,
+                    svc.get_property_val_str("v"),
+                    svc.get_property_val_str("id"),
+                    self_id,
+                );
+                let token = parse::pairing_token(svc.get_property_val_str("t"));
+                match (id, token) {
+                    (Some(id), Some(token)) if svc.get_port() != 0 && open.len() < MAX_TRACKED => {
+                        open.insert(id, (token, svc.get_port()));
+                        open_names.insert(svc.fullname.clone(), id);
+                        devices
+                            .values()
+                            .find(|d| d.id == id)
+                            .map(|d| DiscoveryEvent::Found(with_pairing(d.clone(), &open)))
+                    }
+                    _ => None,
+                }
+            }
+            (Kind::Pairing, ServiceEvent::ServiceRemoved(_, fullname)) => {
+                open_names.remove(&fullname).and_then(|id| {
+                    open.remove(&id);
+                    devices
+                        .values()
+                        .find(|d| d.id == id)
+                        .map(|d| DiscoveryEvent::Found(d.clone()))
+                })
             }
             _ => None,
         };

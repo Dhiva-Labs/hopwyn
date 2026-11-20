@@ -210,7 +210,15 @@ fn parse_partner(line: &str) -> Option<Partner> {
 }
 
 /// This machine's name, shown to other devices.
+/// This computer's name as others see it: `HOPWYN_NAME` if set (for test
+/// copies), else the hostname.
 pub fn device_name() -> String {
+    if let Some(n) = std::env::var("HOPWYN_NAME")
+        .ok()
+        .filter(|n| !n.trim().is_empty())
+    {
+        return n.trim().to_owned();
+    }
     fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_owned())

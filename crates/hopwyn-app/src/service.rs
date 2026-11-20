@@ -14,19 +14,63 @@ use std::time::{Duration, Instant};
 
 use hopwyn_core::{Action, Config, Engine, Input, State};
 use hopwyn_discovery::{Discovery, DiscoveryEvent};
-use hopwyn_input::InputEvent;
 use hopwyn_input::capture::CaptureEvent;
 use hopwyn_input::linux::LinuxEmulator;
 use hopwyn_input::linux_capture::LinuxCapture;
-use hopwyn_pair::{DeviceId, Identity, PairedPeer, PairingCode, PairingLimiter};
+use hopwyn_input::{InputError, InputEvent};
+use hopwyn_pair::{DeviceId, Identity, PairedPeer};
 use hopwyn_proto::{Edge, Message};
 use hopwyn_transport::{Node, PeerConnection, PeerSender, TrustStore};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{self, MAX_PARTNERS, Partner, Store};
-use crate::pairing_net::{self, PAIRING_PORT, PairNetError};
+use crate::pairing_net::{self, PAIRING_PORT, PAIRING_WINDOW, PairNetError};
 
 const LINK_PORT: u16 = 4242;
+
+/// Test mode: `HOPWYN_NO_INPUT=1` skips the desktop's input portals, so
+/// several copies can run on one machine (each with its own
+/// `XDG_CONFIG_HOME` and ports) to test discovery, pairing and the UI.
+fn no_input() -> bool {
+    std::env::var_os("HOPWYN_NO_INPUT").is_some()
+}
+
+fn env_port(name: &str, default: u16) -> u16 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(default)
+}
+
+fn link_port() -> u16 {
+    env_port("HOPWYN_LINK_PORT", LINK_PORT)
+}
+
+fn pairing_port() -> u16 {
+    env_port("HOPWYN_PAIRING_PORT", PAIRING_PORT)
+}
+
+/// Screen-edge capture, or nothing in test mode.
+struct Capture(Option<LinuxCapture>);
+
+impl Capture {
+    fn release(&self) -> Result<(), InputError> {
+        self.0.as_ref().map_or(Ok(()), LinuxCapture::release)
+    }
+
+    fn release_at(&self, position: f32) -> Result<(), InputError> {
+        self.0.as_ref().map_or(Ok(()), |c| c.release_at(position))
+    }
+
+    fn enable(&self) -> Result<(), InputError> {
+        self.0.as_ref().map_or(Ok(()), LinuxCapture::enable)
+    }
+
+    fn set_edges(&self, edges: Vec<Edge>) -> Result<(), InputError> {
+        self.0.as_ref().map_or(Ok(()), |c| c.set_edges(edges))
+    }
+}
 const TICK: Duration = Duration::from_millis(100);
 const RETRY: Duration = Duration::from_secs(2);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(4);
@@ -38,14 +82,13 @@ const ALL_EDGES: [Edge; 4] = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom];
 /// What the UI asks for.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Open the pairing window and show a code.
+    /// Open the pairing window; nearby computers join on their own.
     AddDevice,
     CancelPairing,
-    /// Pair with a nearby device by typing the code it shows.
-    JoinDevice {
-        ip: IpAddr,
-        code: String,
-    },
+    /// The user's answer to "do the codes match?" (true = Pair).
+    ConfirmPairing(bool),
+    /// Join a nearby computer that has its pairing window open.
+    JoinDevice(DeviceId),
     /// Where a paired computer's screen sits relative to this one. If
     /// another paired computer is on that side, the two swap.
     SetEdge {
@@ -70,9 +113,12 @@ pub enum Control {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nearby {
+    pub id: DeviceId,
     pub name: String,
     pub ip: IpAddr,
     pub paired: bool,
+    /// It has "Add computer" open.
+    pub open: bool,
 }
 
 /// What the UI hears.
@@ -91,7 +137,15 @@ pub enum UiEvent {
     },
     Partners(Vec<Partner>),
     Nearby(Vec<Nearby>),
-    PairingCode(String),
+    /// "Add computer" is open, waiting for another computer to join.
+    PairingOpen,
+    /// Both sides reached the code comparison: show the code, ask the user.
+    PairingConfirm {
+        name: String,
+        code: String,
+    },
+    /// The pairing window closed without pairing (cancelled here).
+    PairingClosed,
     PairingDone(String),
     PairingFailed(String),
     Error(String),
@@ -121,32 +175,13 @@ fn run(
     let identity = Arc::new(store.identity(&config::device_name())?);
     let partners = store.partners();
 
-    // Capture first: on GNOME its dialog fails to appear if requested right
-    // after a remote-control session closes.
-    let _ = ui.send_blocking(UiEvent::Waiting(
-        "Allow Hopwyn to capture input in the desktop's dialog".into(),
-    ));
-    let (capture, capture_rx) =
-        LinuxCapture::start_with_token(capture_edges(&partners), store.capture_token())
-            .map_err(|e| e.to_string())?;
-    if let Some(t) = capture.restore_token() {
-        let _ = store.save_capture_token(t);
-    }
-
-    // The remote-control permission: ask once, then reuse the desktop's token.
-    let mut token = store.restore_token();
-    if token.is_none() {
-        let _ = ui.send_blocking(UiEvent::Waiting(
-            "Allow Hopwyn to control input in the desktop's dialog".into(),
-        ));
-        let emu = LinuxEmulator::connect(None).map_err(|e| e.to_string())?;
-        token = emu.restore_token().map(str::to_owned);
-        if let Some(t) = &token {
-            let _ = store.save_restore_token(t);
-        }
-    }
-    std::thread::sleep(SESSION_SETTLE);
-    let _ = capture.enable();
+    let (capture, capture_rx, token) = if no_input() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        (Capture(None), rx, None)
+    } else {
+        let (capture, rx, token) = start_input(ui, &store, &partners)?;
+        (Capture(Some(capture)), rx, token)
+    };
 
     let _ = ui.send_blocking(UiEvent::Ready {
         name: identity.name().to_owned(),
@@ -170,6 +205,48 @@ fn run(
     })
 }
 
+/// Asks for the desktop's input permissions: capture, then remote control.
+fn start_input(
+    ui: &async_channel::Sender<UiEvent>,
+    store: &Store,
+    partners: &[Partner],
+) -> Result<
+    (
+        LinuxCapture,
+        std::sync::mpsc::Receiver<CaptureEvent>,
+        Option<String>,
+    ),
+    String,
+> {
+    // Capture first: on GNOME its dialog fails to appear if requested right
+    // after a remote-control session closes.
+    let _ = ui.send_blocking(UiEvent::Waiting(
+        "Allow Hopwyn to capture input in the desktop's dialog".into(),
+    ));
+    let (capture, capture_rx) =
+        LinuxCapture::start_with_token(capture_edges(partners), store.capture_token())
+            .map_err(|e| e.to_string())?;
+    if let Some(t) = capture.restore_token() {
+        let _ = store.save_capture_token(t);
+    }
+
+    // The remote-control permission: ask once, then reuse the desktop's token.
+    let mut token = store.restore_token();
+    if token.is_none() {
+        let _ = ui.send_blocking(UiEvent::Waiting(
+            "Allow Hopwyn to control input in the desktop's dialog".into(),
+        ));
+        let emu = LinuxEmulator::connect(None).map_err(|e| e.to_string())?;
+        token = emu.restore_token().map(str::to_owned);
+        if let Some(t) = &token {
+            let _ = store.save_restore_token(t);
+        }
+    }
+    std::thread::sleep(SESSION_SETTLE);
+    let _ = capture.enable();
+    Ok((capture, capture_rx, token))
+}
+
 /// The edges to put barriers on. With nothing paired, keep one on the
 /// right so the capture session stays valid; hits there are released.
 fn capture_edges(partners: &[Partner]) -> Vec<Edge> {
@@ -189,12 +266,35 @@ enum Internal {
     /// those of the link it replaced.
     PeerMessage(DeviceId, u64, Message),
     PeerGone(DeviceId, u64),
-    Nearby(HashMap<DeviceId, (String, SocketAddr)>),
-    Paired(
-        Result<PairedPeer, PairNetError>,
-        bool,
-        Option<PairingLimiter>,
-    ),
+    Nearby(HashMap<DeviceId, Seen>),
+    /// A pairing reached the code comparison; the sender takes the answer.
+    Compare {
+        name: String,
+        code: String,
+        answer: oneshot::Sender<bool>,
+    },
+    /// A pairing finished; `true` if this computer was the host.
+    Paired(Result<PairedPeer, PairNetError>, bool),
+}
+
+/// A computer seen on the network: name, link addresses, pairing token.
+#[derive(Debug, Clone)]
+struct Seen {
+    name: String,
+    /// Every IPv4 address it announced (some may be unreachable, such as a
+    /// virtual machine bridge), so each gets tried.
+    addrs: Vec<SocketAddr>,
+    pairing: Option<String>,
+    pairing_port: u16,
+}
+
+/// A pairing in progress.
+struct Pairing {
+    task: tokio::task::JoinHandle<()>,
+    /// Set while this computer hosts and no guest has joined yet.
+    hosting: bool,
+    /// Takes the user's answer once the codes are shown.
+    answer: Option<oneshot::Sender<bool>>,
 }
 
 /// One paired computer and the state of the handoff with it.
@@ -213,15 +313,16 @@ struct Service {
     partners_tx: watch::Sender<Vec<Partner>>,
     connected: Arc<Mutex<HashSet<DeviceId>>>,
     token: Option<String>,
-    capture: LinuxCapture,
+    capture: Capture,
     trust: TrustStore,
     tx: mpsc::UnboundedSender<Internal>,
     rx: mpsc::UnboundedReceiver<Internal>,
-    _discovery: Discovery,
+    discovery: Discovery,
     emulator: Option<LinuxEmulator>,
-    nearby: HashMap<DeviceId, (String, SocketAddr)>,
-    pairing: Option<tokio::task::JoinHandle<()>>,
-    limiter: PairingLimiter,
+    nearby: HashMap<DeviceId, Seen>,
+    pairing: Option<Pairing>,
+    /// Pairing windows already tried as a guest, so each prompts once.
+    tried: HashSet<(DeviceId, String)>,
     next_generation: u64,
     last_status: Option<(Vec<DeviceId>, Control)>,
 }
@@ -233,7 +334,7 @@ impl Service {
         identity: Arc<Identity>,
         partners: Vec<Partner>,
         token: Option<String>,
-        capture: LinuxCapture,
+        capture: Capture,
         capture_rx: std::sync::mpsc::Receiver<CaptureEvent>,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -244,15 +345,15 @@ impl Service {
         let node = Arc::new(
             Node::bind(
                 &identity,
-                SocketAddr::from(([0, 0, 0, 0], LINK_PORT)),
+                SocketAddr::from(([0, 0, 0, 0], link_port())),
                 trust.clone(),
             )
-            .map_err(|e| format!("could not open UDP port {LINK_PORT}: {e}"))?,
+            .map_err(|e| format!("could not open UDP port {}: {e}", link_port()))?,
         );
         let (discovery, found) =
-            Discovery::start(&identity, LINK_PORT).map_err(|e| e.to_string())?;
+            Discovery::start(&identity, link_port()).map_err(|e| e.to_string())?;
         let (partners_tx, partners_rx) = watch::channel(partners.clone());
-        let addresses: Arc<Mutex<HashMap<DeviceId, SocketAddr>>> = Arc::default();
+        let addresses: Arc<Mutex<HashMap<DeviceId, Vec<SocketAddr>>>> = Arc::default();
         let connected: Arc<Mutex<HashSet<DeviceId>>> = Arc::default();
 
         // Capture events: std channel -> loop.
@@ -269,15 +370,29 @@ impl Service {
         let disc_tx = tx.clone();
         let disc_addrs = addresses.clone();
         std::thread::spawn(move || {
-            let mut seen: HashMap<DeviceId, (String, SocketAddr)> = HashMap::new();
+            let mut seen: HashMap<DeviceId, Seen> = HashMap::new();
             while let Ok(ev) = found.recv() {
                 match ev {
                     DiscoveryEvent::Found(d) => {
-                        if let Some(a) = d.addrs.iter().copied().find(SocketAddr::is_ipv4) {
-                            seen.insert(d.id, (d.name, a));
+                        let v4: Vec<SocketAddr> = d
+                            .addrs
+                            .iter()
+                            .copied()
+                            .filter(SocketAddr::is_ipv4)
+                            .collect();
+                        if !v4.is_empty() {
                             if let Ok(mut m) = disc_addrs.lock() {
-                                m.insert(d.id, a);
+                                m.insert(d.id, v4.clone());
                             }
+                            seen.insert(
+                                d.id,
+                                Seen {
+                                    name: d.name,
+                                    addrs: v4,
+                                    pairing: d.pairing,
+                                    pairing_port: d.pairing_port.unwrap_or(PAIRING_PORT),
+                                },
+                            );
                         }
                     }
                     DiscoveryEvent::Lost(id) => {
@@ -315,6 +430,8 @@ impl Service {
         let mut dial_partners = partners_rx;
         let dial_connected = connected.clone();
         tokio::spawn(async move {
+            // The address that last worked for each computer goes first.
+            let mut good: HashMap<DeviceId, SocketAddr> = HashMap::new();
             loop {
                 let targets: Vec<DeviceId> = dial_partners
                     .borrow()
@@ -327,23 +444,35 @@ impl Service {
                         .lock()
                         .map(|c| c.contains(&id))
                         .unwrap_or(true);
-                    let addr = addresses.lock().ok().and_then(|m| m.get(&id).copied());
-                    let Some(addr) = addr.filter(|_| !up) else {
+                    if up {
                         continue;
-                    };
-                    if let Ok(Ok(conn)) =
-                        tokio::time::timeout(DIAL_TIMEOUT, node.connect(addr)).await
-                    {
+                    }
+                    let mut addrs = addresses
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&id).cloned())
+                        .unwrap_or_default();
+                    if let Some(g) = good.get(&id) {
+                        addrs.sort_by_key(|a| a != g);
+                    }
+                    for addr in addrs {
+                        let Ok(Ok(conn)) =
+                            tokio::time::timeout(DIAL_TIMEOUT, node.connect(addr)).await
+                        else {
+                            continue;
+                        };
                         if conn.peer() != id {
                             conn.close();
                             continue;
                         }
+                        good.insert(id, addr);
                         if let Ok(mut c) = dial_connected.lock() {
                             c.insert(id);
                         }
                         if hand_over(conn, &dial_tx).is_err() {
                             return;
                         }
+                        break;
                     }
                 }
                 tokio::select! {
@@ -374,11 +503,11 @@ impl Service {
             trust,
             tx,
             rx,
-            _discovery: discovery,
+            discovery,
             emulator: None,
             nearby: HashMap::new(),
             pairing: None,
-            limiter: PairingLimiter::new(),
+            tried: HashSet::new(),
             next_generation: 1,
             last_status: None,
         })
@@ -495,16 +624,36 @@ impl Service {
                 self.disconnect(i).await;
             }
             Internal::Nearby(map) => {
+                if debug_on() {
+                    for seen in map.values() {
+                        eprintln!(
+                            "[hopwyn {}] nearby: {} at {:?} pairing={:?}",
+                            stamp(),
+                            seen.name,
+                            seen.addrs,
+                            seen.pairing
+                        );
+                    }
+                }
                 self.nearby = map;
                 self.publish_nearby();
+                self.join_open_windows();
             }
-            Internal::Paired(result, initiator, limiter) => {
-                self.pairing = None;
-                if let Some(l) = limiter {
-                    self.limiter = l;
+            Internal::Compare { name, code, answer } => {
+                if let Some(p) = self.pairing.as_mut() {
+                    p.hosting = false;
+                    p.answer = Some(answer);
                 }
+                // The window is no longer needed: one guest at a time.
+                let _ = self.discovery.set_pairing(None, 0);
+                self.send_ui(UiEvent::PairingConfirm { name, code });
+            }
+            Internal::Paired(result, host) => {
+                self.pairing = None;
+                let _ = self.discovery.set_pairing(None, 0);
                 match result {
-                    Ok(peer) => self.adopt_partner(peer, initiator),
+                    Ok(peer) => self.adopt_partner(peer, host),
+                    Err(PairNetError::Cancelled) => self.send_ui(UiEvent::PairingClosed),
                     Err(e) => self.send_ui(UiEvent::PairingFailed(e.to_string())),
                 }
             }
@@ -641,38 +790,20 @@ impl Service {
 
     fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::AddDevice => self.start_pairing(),
-            Command::CancelPairing => {
-                if let Some(h) = self.pairing.take() {
-                    h.abort();
+            Command::AddDevice => self.start_hosting(),
+            Command::CancelPairing => self.cancel_pairing(),
+            Command::ConfirmPairing(yes) => {
+                if let Some(answer) = self.pairing.as_mut().and_then(|p| p.answer.take()) {
+                    let _ = answer.send(yes);
                 }
-                self.limiter.close();
             }
-            Command::JoinDevice { ip, code } => {
-                let Some(code) = PairingCode::parse(&code) else {
-                    self.send_ui(UiEvent::PairingFailed(
-                        "enter the 6 digits shown on the other device".into(),
-                    ));
-                    return;
-                };
-                if self.peers.len() >= MAX_PARTNERS {
-                    self.send_ui(UiEvent::PairingFailed(full_message()));
-                    return;
+            Command::JoinDevice(id) => {
+                if let Some(seen) = self.nearby.get(&id).cloned() {
+                    if let Some(t) = &seen.pairing {
+                        self.tried.insert((id, t.clone()));
+                    }
+                    self.start_guest(id, &seen);
                 }
-                if let Some(h) = self.pairing.take() {
-                    h.abort();
-                }
-                let identity = self.identity.clone();
-                let tx = self.tx.clone();
-                self.pairing = Some(tokio::spawn(async move {
-                    let r = pairing_net::run_joiner(
-                        SocketAddr::new(ip, PAIRING_PORT),
-                        &identity,
-                        &code,
-                    )
-                    .await;
-                    let _ = tx.send(Internal::Paired(r, false, None));
-                }));
             }
             Command::SetEdge { id, edge } => {
                 let Some(i) = self.peer_index(&id) else {
@@ -732,42 +863,135 @@ impl Service {
         self.send_ui(UiEvent::Partners(partners));
     }
 
-    fn start_pairing(&mut self) {
+    /// "Add computer": listen for a guest and announce the open window.
+    fn start_hosting(&mut self) {
         if self.peers.len() >= MAX_PARTNERS {
             self.send_ui(UiEvent::PairingFailed(full_message()));
             return;
         }
-        if let Some(h) = self.pairing.take() {
-            h.abort();
-        }
-        let mut limiter = std::mem::take(&mut self.limiter);
-        if let Err(e) = limiter.check(Instant::now())
-            && !matches!(e, hopwyn_pair::LimiterError::WindowClosed)
-        {
-            self.limiter = limiter;
+        self.cancel_pairing();
+        let token = pairing_token(&self.identity);
+        if let Err(e) = self.discovery.set_pairing(Some(&token), pairing_port()) {
             self.send_ui(UiEvent::PairingFailed(e.to_string()));
             return;
         }
-        limiter.open(Instant::now());
-        let code = PairingCode::generate();
-        self.send_ui(UiEvent::PairingCode(code.as_str().to_owned()));
+        self.send_ui(UiEvent::PairingOpen);
         let identity = self.identity.clone();
         let tx = self.tx.clone();
-        self.pairing = Some(tokio::spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(("0.0.0.0", PAIRING_PORT)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = tx.send(Internal::Paired(
-                        Err(PairNetError::Io(e.to_string())),
-                        true,
-                        Some(limiter),
-                    ));
+        let task = tokio::spawn(async move {
+            let r = async {
+                let listener = tokio::net::TcpListener::bind(("0.0.0.0", pairing_port()))
+                    .await
+                    .map_err(|e| PairNetError::Io(e.to_string()))?;
+                let pending = tokio::time::timeout(
+                    PAIRING_WINDOW,
+                    pairing_net::host_accept(&listener, &identity),
+                )
+                .await
+                .map_err(|_| PairNetError::Timeout)??;
+                drop(listener);
+                let (answer, local) = oneshot::channel();
+                let _ = tx.send(Internal::Compare {
+                    name: pending.compared.peer().name.clone(),
+                    code: pending.compared.code().to_owned(),
+                    answer,
+                });
+                pairing_net::finish(pending, local).await
+            }
+            .await;
+            let _ = tx.send(Internal::Paired(r, true));
+        });
+        self.pairing = Some(Pairing {
+            task,
+            hosting: true,
+            answer: None,
+        });
+    }
+
+    /// Joins a nearby computer's open pairing window.
+    fn start_guest(&mut self, id: DeviceId, seen: &Seen) {
+        if self.peers.len() >= MAX_PARTNERS && self.peer_index(&id).is_none() {
+            self.send_ui(UiEvent::PairingFailed(full_message()));
+            return;
+        }
+        self.cancel_pairing();
+        let _ = self.discovery.set_pairing(None, 0);
+        let addrs: Vec<SocketAddr> = seen
+            .addrs
+            .iter()
+            .map(|a| SocketAddr::new(a.ip(), seen.pairing_port))
+            .collect();
+        self.debug(&format!(
+            "joining {}'s pairing window at {addrs:?}",
+            seen.name
+        ));
+        let identity = self.identity.clone();
+        let tx = self.tx.clone();
+        let task = tokio::spawn(async move {
+            let r = async {
+                let pending = pairing_net::guest_connect_any(&addrs, &identity).await?;
+                let (answer, local) = oneshot::channel();
+                let _ = tx.send(Internal::Compare {
+                    name: pending.compared.peer().name.clone(),
+                    code: pending.compared.code().to_owned(),
+                    answer,
+                });
+                pairing_net::finish(pending, local).await
+            }
+            .await;
+            let _ = tx.send(Internal::Paired(r, false));
+        });
+        self.pairing = Some(Pairing {
+            task,
+            hosting: false,
+            answer: None,
+        });
+    }
+
+    /// Ends any pairing in progress. Codes already shown get a Cancel sent
+    /// to the other side.
+    fn cancel_pairing(&mut self) {
+        if let Some(mut p) = self.pairing.take() {
+            match p.answer.take() {
+                // finish() sends the cancel and reports back.
+                Some(answer) => {
+                    let _ = answer.send(false);
+                    self.pairing = Some(p);
                     return;
                 }
-            };
-            let r = pairing_net::run_initiator(listener, &identity, &code, &mut limiter).await;
-            let _ = tx.send(Internal::Paired(r, true, Some(limiter)));
-        }));
+                None => p.task.abort(),
+            }
+        }
+        let _ = self.discovery.set_pairing(None, 0);
+    }
+
+    /// Joins, on its own, a nearby computer that just opened "Add computer",
+    /// once per window, unless the two are already paired and linked. If
+    /// both opened it at once, the lower key joins.
+    fn join_open_windows(&mut self) {
+        let me = self.identity.id();
+        let candidate = self.nearby.iter().find_map(|(id, seen)| {
+            let token = seen.pairing.clone()?;
+            let fresh = !self.tried.contains(&(*id, token.clone()));
+            // Join unless already paired and linked; a computer that forgot
+            // this one can't link, so it gets to pair again.
+            let linked = self
+                .peer_index(id)
+                .and_then(|i| self.peers.get(i))
+                .is_some_and(|p| p.sender.is_some());
+            let room = self.peers.len() < MAX_PARTNERS || self.peer_index(id).is_some();
+            (fresh && !linked && room).then(|| (*id, token, seen.clone()))
+        });
+        let Some((id, token, seen)) = candidate else {
+            return;
+        };
+        match &self.pairing {
+            None => {}
+            Some(p) if p.hosting && me.as_bytes() < id.as_bytes() => {}
+            Some(_) => return,
+        }
+        self.tried.insert((id, token));
+        self.start_guest(id, &seen);
     }
 
     fn adopt_partner(&mut self, peer: PairedPeer, initiator: bool) {
@@ -825,7 +1049,7 @@ impl Service {
     }
 
     fn push_to_edge(&mut self, edge: Edge) {
-        if self.emulator.is_none() {
+        if self.emulator.is_none() && self.capture.0.is_some() {
             let restore = self.token.clone();
             match tokio::task::block_in_place(|| LinuxEmulator::connect(restore.as_deref())) {
                 Ok(e) => {
@@ -888,10 +1112,14 @@ impl Service {
         let mut list: Vec<Nearby> = self
             .nearby
             .iter()
-            .map(|(id, (name, addr))| Nearby {
-                name: name.clone(),
-                ip: addr.ip(),
-                paired: self.peer_index(id).is_some(),
+            .filter_map(|(id, seen)| {
+                Some(Nearby {
+                    id: *id,
+                    name: seen.name.clone(),
+                    ip: seen.addrs.first()?.ip(),
+                    paired: self.peer_index(id).is_some(),
+                    open: seen.pairing.is_some(),
+                })
             })
             .collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
@@ -910,6 +1138,20 @@ impl Service {
             eprintln!("[hopwyn {}] {text}", stamp());
         }
     }
+}
+
+/// A new token for each pairing window (not secret: it only lets other
+/// computers prompt once per window).
+fn pairing_token(identity: &Identity) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut x = u64::try_from(nanos & u128::from(u64::MAX)).unwrap_or(0);
+    for b in identity.id().as_bytes() {
+        x = x.rotate_left(5) ^ u64::from(*b);
+    }
+    format!("{x:016x}")
 }
 
 fn full_message() -> String {

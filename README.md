@@ -3,7 +3,7 @@
 One mouse and keyboard for every computer and phone in your home. Move the cursor off the edge of one screen and it appears on the next. The machine you left goes inactive; the one you entered becomes active.
 
 - **Cross-platform:** Windows, macOS and Linux (X11 and Wayland) in v1.0; Android and iOS in v1.1.
-- **One-click setup:** devices find each other on your home network. Type the 6-digit code shown on the other device once and you're paired.
+- **One-click setup:** devices find each other on your home network. Click **Add computer** on one; the other asks on its own. Check both show the same 6-digit code and click **Pair** on each. Nothing to type.
 - **Two-way:** any device's mouse and keyboard can drive any other. No fixed server.
 - **Private and secure:** no account, no cloud, no telemetry. Everything stays on your home network, end-to-end encrypted. See [SECURITY.md](SECURITY.md).
 
@@ -22,11 +22,15 @@ scripts/install-linux.sh --uninstall
 Then open **Hopwyn** from your app launcher on both computers:
 
 1. Allow the two desktop permission dialogs (capture input, then remote control). Remote control is asked only once. GNOME 50 and older can't remember the capture permission, so it is asked once each time you log in; Hopwyn keeps running when you close its window so it isn't asked again. Desktops with InputCapture portal version 2 remember it too.
-2. On one computer click **Add computer**; it shows a 6-digit code for 2 minutes.
-3. On the other, pick that computer under **Nearby**, click **Pair…** and type the code.
+2. On one computer click **Add computer** (it stays open for 2 minutes).
+3. The other computer pops up a pairing dialog on its own within a few seconds. Check both screens show the same 6-digit code and click **Pair** on both. (If you dismissed it, click **Pair** next to the computer under **Nearby**.)
 4. Choose which side the other screen is on, then move the cursor off that edge. Repeat with **Add computer** for up to 4 computers, one on each side.
 
 **Ctrl+Alt+Esc** always gives your cursor back. The firewall must allow UDP 4242 (link), UDP 5353 (discovery) and, while pairing, TCP 4243 between the computers.
+
+### Testing on one machine
+
+`HOPWYN_NO_INPUT=1` skips the desktop's input permissions so several copies can run side by side to test discovery, pairing and the window (not the cursor handoff). Give each its own `XDG_CONFIG_HOME`, `HOPWYN_NAME`, `HOPWYN_LINK_PORT` and `HOPWYN_PAIRING_PORT`; GTK's broadway backend (`gtk4-broadwayd --address 127.0.0.1 :5`, then `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5`) shows each in a browser tab.
 
 ## Releases
 
@@ -48,7 +52,7 @@ Then open **Hopwyn** from your app launcher on both computers:
 | Path | What it is |
 | --- | --- |
 | `crates/hopwyn-proto` | Wire protocol: message types and a bounded binary encoding |
-| `crates/hopwyn-pair` | Device identity (Ed25519) and 6-digit-code pairing (SPAKE2), with pairing window and lockout |
+| `crates/hopwyn-pair` | Device identity (Ed25519); pairing by comparing a code on both screens, plus typed-code pairing (SPAKE2) with a pairing window and lockout |
 | `crates/hopwyn-transport` | QUIC + TLS 1.3 transport with pinned device keys, home-network-only policy, framed messages |
 | `crates/hopwyn-discovery` | mDNS / DNS-SD announce and browse (`_hopwyn._udp`), with strict validation of what it hears |
 | `crates/hopwyn-input` | Input events, HID-to-native key mapping, injection (Linux: RemoteDesktop portal + libei) and screen-edge capture (Linux: InputCapture portal + libei), with a Ctrl+Alt+Esc panic release |

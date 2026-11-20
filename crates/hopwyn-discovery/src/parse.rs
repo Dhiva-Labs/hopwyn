@@ -18,6 +18,20 @@ pub struct DiscoveredDevice {
     pub name: String,
     /// Home-network addresses only, IPv4 first.
     pub addrs: Vec<SocketAddr>,
+    /// Set while the device has "Add computer" open: a token that changes
+    /// each time, so a prompt is shown once per pairing window.
+    pub pairing: Option<String>,
+    /// The TCP port it pairs on, if it announced one.
+    pub pairing_port: Option<u16>,
+}
+
+/// Accepts a pairing token of 1 to 16 lowercase hex digits.
+pub(crate) fn pairing_token(raw: Option<&str>) -> Option<String> {
+    let t = raw?;
+    let ok = (1..=16).contains(&t.len())
+        && t.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    ok.then(|| t.to_owned())
 }
 
 /// DNS-SD instance name: the first 16 bytes of the device key in hex
@@ -58,6 +72,22 @@ fn clean_name(raw: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
+/// Checks a pairing-window announcement and returns whose it is. Its
+/// instance name must match the key it claims, like a device announcement.
+pub(crate) fn pairing_owner(
+    fullname: &str,
+    version: Option<&str>,
+    id: Option<&str>,
+    self_id: DeviceId,
+) -> Option<DeviceId> {
+    if version? != TXT_VERSION {
+        return None;
+    }
+    let id = parse_id(&id?.to_ascii_lowercase())?;
+    let expected = format!("{}.{}", instance_name(&id), crate::PAIR_SERVICE_TYPE);
+    (id != self_id && fullname == expected).then_some(id)
+}
+
 /// Checks one resolved announcement. `None` means ignore it.
 pub(crate) fn validate(
     fullname: &str,
@@ -92,7 +122,13 @@ pub(crate) fn validate(
     if addrs.is_empty() {
         return None;
     }
-    Some(DiscoveredDevice { id, name, addrs })
+    Some(DiscoveredDevice {
+        id,
+        name,
+        addrs,
+        pairing: None,
+        pairing_port: None,
+    })
 }
 
 #[cfg(test)]
@@ -117,6 +153,33 @@ mod tests {
 
     fn me() -> DeviceId {
         Identity::generate("me").id()
+    }
+
+    #[test]
+    fn pairing_owner_must_match_its_instance_name() {
+        let peer = Identity::generate("Laptop").id();
+        let hex_id = hex(peer.as_bytes());
+        let good = format!("{}.{}", instance_name(&peer), crate::PAIR_SERVICE_TYPE);
+        assert_eq!(
+            pairing_owner(&good, Some("1"), Some(&hex_id), me()),
+            Some(peer)
+        );
+        let other = Identity::generate("Other").id();
+        let wrong = format!("{}.{}", instance_name(&other), crate::PAIR_SERVICE_TYPE);
+        assert_eq!(pairing_owner(&wrong, Some("1"), Some(&hex_id), me()), None);
+        assert_eq!(pairing_owner(&good, Some("2"), Some(&hex_id), me()), None);
+        assert_eq!(pairing_owner(&good, Some("1"), None, me()), None);
+        assert_eq!(pairing_owner(&good, Some("1"), Some(&hex_id), peer), None);
+    }
+
+    #[test]
+    fn pairing_tokens_are_validated() {
+        assert_eq!(pairing_token(Some("0a1b2c3d")), Some("0a1b2c3d".into()));
+        assert_eq!(pairing_token(None), None);
+        assert_eq!(pairing_token(Some("")), None);
+        assert_eq!(pairing_token(Some("XYZ")), None);
+        assert_eq!(pairing_token(Some("ABCD")), None);
+        assert_eq!(pairing_token(Some("0123456789abcdef0")), None);
     }
 
     #[test]

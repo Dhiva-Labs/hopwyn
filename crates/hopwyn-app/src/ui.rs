@@ -1,7 +1,6 @@
 //! The Hopwyn window (GTK 4 + libadwaita).
 
 use std::cell::{Cell, RefCell};
-use std::net::IpAddr;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -67,7 +66,12 @@ fn edge_words(edge: Edge) -> &'static str {
 /// `--background` starts Hopwyn without showing its window (used at login).
 pub fn run() -> glib::ExitCode {
     let background = std::env::args().any(|a| a == "--background");
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    let mut builder = adw::Application::builder().application_id(APP_ID);
+    // Test copies (see service::no_input) must not merge into one app.
+    if std::env::var_os("HOPWYN_NO_INPUT").is_some() {
+        builder = builder.flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
     let first = Cell::new(true);
     app.connect_activate(move |app| {
         if let Some(win) = app.windows().first() {
@@ -108,12 +112,14 @@ struct Ui {
     layout: gtk::Grid,
     /// Left, right, top, bottom.
     layout_tiles: [gtk::Label; 4],
-    partner_rows: RefCell<Vec<(DeviceId, adw::ComboRow)>>,
+    partner_rows: RefCell<Vec<(DeviceId, adw::ActionRow)>>,
     empty_row: adw::ActionRow,
     nearby_group: adw::PreferencesGroup,
     nearby_empty: adw::ActionRow,
     nearby_rows: RefCell<Vec<adw::ActionRow>>,
     code_dialog: RefCell<Option<adw::AlertDialog>>,
+    /// "Waiting for … to click Pair", dismissed when pairing ends.
+    waiting_toast: RefCell<Option<adw::Toast>>,
     cmd: UnboundedSender<Command>,
     partners: RefCell<Vec<Partner>>,
     status: RefCell<(Vec<DeviceId>, Control)>,
@@ -237,18 +243,20 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
     partner_group.add(&layout);
     let empty_row = adw::ActionRow::builder()
         .title("No computer paired yet")
-        .subtitle("Pair one under Nearby, or show a code with Add computer")
+        .subtitle("Click Add computer here, or Pair on a computer listed under Nearby")
         .build();
     partner_group.add(&empty_row);
 
     // Add a device.
     let add_group = adw::PreferencesGroup::builder()
         .title("Add a computer")
-        .description("Open Hopwyn on the other computer too. One shows a code, the other types it.")
+        .description(
+            "Open Hopwyn on the other computer too. Both show the same code; click Pair on each.",
+        )
         .build();
     let add_row = adw::ActionRow::builder()
-        .title("Show a pairing code")
-        .subtitle("Valid for 2 minutes")
+        .title("Pair a computer")
+        .subtitle("Nearby computers running Hopwyn are asked automatically")
         .activatable(true)
         .build();
     add_row.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
@@ -343,6 +351,7 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         nearby_empty,
         nearby_rows: RefCell::new(Vec::new()),
         code_dialog: RefCell::new(None),
+        waiting_toast: RefCell::new(None),
         cmd,
         partners: RefCell::new(Vec::new()),
         status: RefCell::new((Vec::new(), Control::Local)),
@@ -413,13 +422,20 @@ impl Ui {
                 self.refresh_card();
             }
             UiEvent::Nearby(list) => self.refresh_nearby(&list),
-            UiEvent::PairingCode(code) => self.show_code(&code),
+            UiEvent::PairingOpen => self.show_waiting(),
+            UiEvent::PairingConfirm { name, code } => self.show_compare(&name, &code),
+            UiEvent::PairingClosed => {
+                self.close_code_dialog();
+                self.dismiss_waiting();
+            }
             UiEvent::PairingDone(name) => {
                 self.close_code_dialog();
+                self.dismiss_waiting();
                 self.toast(&format!("Paired with {name}"));
             }
             UiEvent::PairingFailed(why) => {
                 self.close_code_dialog();
+                self.dismiss_waiting();
                 self.toast(&format!("Pairing failed: {why}"));
             }
             UiEvent::Error(e) | UiEvent::Fatal(e) => {
@@ -431,6 +447,13 @@ impl Ui {
                     "problem",
                 );
             }
+        }
+    }
+
+    fn dismiss_waiting(&self) {
+        let toast = self.waiting_toast.borrow_mut().take();
+        if let Some(t) = toast {
+            t.dismiss();
         }
     }
 
@@ -567,12 +590,17 @@ impl Ui {
             self.partner_group.add(&self.empty_row);
         }
         for p in partners {
-            let row = adw::ComboRow::builder()
-                .title(&p.name)
-                .model(&gtk::StringList::new(&SIDES))
-                .build();
+            // A plain row with its own controls: an activatable row would
+            // take the clicks meant for the Forget button.
+            let row = adw::ActionRow::builder().title(&p.name).build();
             row.add_prefix(&gtk::Image::from_icon_name("computer-symbolic"));
-            row.set_selected(edge_index(p.edge));
+            let side = gtk::DropDown::builder()
+                .model(&gtk::StringList::new(&SIDES))
+                .valign(gtk::Align::Center)
+                .tooltip_text(format!("Where {}'s screen is", p.name))
+                .build();
+            side.set_selected(edge_index(p.edge));
+            row.add_suffix(&side);
             let forget = gtk::Button::builder()
                 .icon_name("user-trash-symbolic")
                 .tooltip_text(format!("Forget {}", p.name))
@@ -589,8 +617,8 @@ impl Ui {
                 // Connected after set_selected, so building the row sends nothing.
                 let ui = self.clone();
                 let id = p.id;
-                row.connect_selected_notify(move |row| {
-                    if let Some(edge) = index_edge(row.selected()) {
+                side.connect_selected_notify(move |side| {
+                    if let Some(edge) = index_edge(side.selected()) {
                         let _ = ui.cmd.send(Command::SetEdge { id, edge });
                     }
                 });
@@ -615,9 +643,14 @@ impl Ui {
             self.nearby_group.remove(&self.nearby_empty);
         }
         for n in list {
+            let subtitle = if n.paired || n.open {
+                n.ip.to_string()
+            } else {
+                format!("{} · Click Add computer on it to pair", n.ip)
+            };
             let row = adw::ActionRow::builder()
                 .title(&n.name)
-                .subtitle(n.ip.to_string())
+                .subtitle(subtitle)
                 .build();
             row.add_prefix(&gtk::Image::from_icon_name("computer-symbolic"));
             if n.paired {
@@ -626,14 +659,15 @@ impl Ui {
                     .css_classes(["dim-label"])
                     .build();
                 row.add_suffix(&tag);
-            } else {
+            } else if n.open {
                 let button = gtk::Button::builder()
-                    .label("Pair…")
+                    .label("Pair")
                     .valign(gtk::Align::Center)
+                    .css_classes(["suggested-action"])
                     .build();
                 let ui = self.clone();
-                let (name, ip) = (n.name.clone(), n.ip);
-                button.connect_clicked(move |_| ui.show_join_dialog(&name, ip));
+                let id = n.id;
+                button.connect_clicked(move |_| ui.join(id));
                 row.add_suffix(&button);
                 row.set_activatable_widget(Some(&button));
             }
@@ -653,8 +687,53 @@ impl Ui {
         let _ = self.cmd.send(Command::AddDevice);
     }
 
-    fn show_code(self: &Rc<Self>, code: &str) {
+    /// Shows `dialog` as the current pairing dialog. If the user closes
+    /// it (rather than the app replacing it), `on_user` gets the response.
+    fn set_code_dialog(
+        self: &Rc<Self>,
+        dialog: &adw::AlertDialog,
+        on_user: impl Fn(&Rc<Self>, &str) + 'static,
+    ) {
         self.close_code_dialog();
+        let ui = self.clone();
+        dialog.connect_response(None, move |_, response| {
+            // Still stored means the user answered; close_code_dialog takes
+            // it out first, so closing it from code doesn't count.
+            let by_user = ui.code_dialog.borrow_mut().take().is_some();
+            if by_user {
+                on_user(&ui, response);
+            }
+        });
+        dialog.present(Some(&self.window));
+        *self.code_dialog.borrow_mut() = Some(dialog.clone());
+    }
+
+    /// "Add computer" is open: tell the user what happens next.
+    fn show_waiting(self: &Rc<Self>) {
+        let spinner = gtk::Spinner::builder()
+            .spinning(true)
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .build();
+        let dialog = adw::AlertDialog::new(
+            Some("Waiting for the other computer"),
+            Some(
+                "Open Hopwyn on the other computer. It will show a pairing code on its own within a few seconds.",
+            ),
+        );
+        dialog.set_extra_child(Some(&spinner));
+        dialog.add_response("cancel", "Cancel");
+        dialog.set_close_response("cancel");
+        self.set_code_dialog(&dialog, |ui, _| {
+            let _ = ui.cmd.send(Command::CancelPairing);
+        });
+    }
+
+    /// Both computers show this code; pair only if they match.
+    fn show_compare(self: &Rc<Self>, name: &str, code: &str) {
+        // Hopwyn may be running with its window closed.
+        self.window.present();
         let spaced = format!(
             "{} {}",
             code.get(..3).unwrap_or(""),
@@ -666,25 +745,28 @@ impl Ui {
             .selectable(true)
             .build();
         let dialog = adw::AlertDialog::new(
-            Some("Pairing code"),
-            Some(
-                "On the other computer, open Hopwyn, choose this computer under Nearby and type this code. It works for 2 minutes.",
-            ),
+            Some(&format!("Pair with {name}?")),
+            Some(&format!(
+                "Check that {name} shows the same code, then click Pair on both computers."
+            )),
         );
         dialog.set_extra_child(Some(&label));
         dialog.add_response("cancel", "Cancel");
+        dialog.add_response("pair", "Pair");
+        dialog.set_response_appearance("pair", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("pair"));
         dialog.set_close_response("cancel");
-        let ui = self.clone();
-        dialog.connect_response(None, move |_, response| {
-            // Still stored means the user cancelled; close_code_dialog
-            // takes it out first, so closing on success doesn't cancel.
-            let user_cancelled = ui.code_dialog.borrow_mut().take().is_some();
-            if response == "cancel" && user_cancelled {
-                let _ = ui.cmd.send(Command::CancelPairing);
+        let name = name.to_owned();
+        self.set_code_dialog(&dialog, move |ui, response| {
+            let yes = response == "pair";
+            let _ = ui.cmd.send(Command::ConfirmPairing(yes));
+            if yes {
+                let toast = adw::Toast::new(&format!("Waiting for {name} to click Pair…"));
+                toast.set_timeout(0);
+                ui.toasts.add_toast(toast.clone());
+                *ui.waiting_toast.borrow_mut() = Some(toast);
             }
         });
-        dialog.present(Some(&self.window));
-        *self.code_dialog.borrow_mut() = Some(dialog);
     }
 
     fn close_code_dialog(&self) {
@@ -709,44 +791,10 @@ impl Ui {
         true
     }
 
-    fn show_join_dialog(self: &Rc<Self>, name: &str, ip: IpAddr) {
-        if !self.check_ready() {
-            return;
+    fn join(self: &Rc<Self>, id: DeviceId) {
+        if self.check_ready() {
+            let _ = self.cmd.send(Command::JoinDevice(id));
         }
-        let entry = gtk::Entry::builder()
-            .placeholder_text("123 456")
-            .input_purpose(gtk::InputPurpose::Digits)
-            .max_length(7)
-            .activates_default(true)
-            .build();
-        let dialog = adw::AlertDialog::new(
-            Some(&format!("Pair with {name}")),
-            Some(&format!(
-                "On {name}, click Add computer, then type the code it shows."
-            )),
-        );
-        dialog.set_extra_child(Some(&entry));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("pair", "Pair");
-        dialog.set_response_appearance("pair", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("pair"));
-        dialog.set_close_response("cancel");
-        let ui = self.clone();
-        let name = name.to_owned();
-        let code_entry = entry.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response == "pair" {
-                let code: String = code_entry
-                    .text()
-                    .chars()
-                    .filter(char::is_ascii_digit)
-                    .collect();
-                ui.toast(&format!("Pairing with {name}…"));
-                let _ = ui.cmd.send(Command::JoinDevice { ip, code });
-            }
-        });
-        dialog.present(Some(&self.window));
-        entry.grab_focus();
     }
 
     fn confirm_forget(self: &Rc<Self>, id: DeviceId, name: &str) {

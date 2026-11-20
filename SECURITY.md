@@ -8,7 +8,7 @@ Please do not open a public issue. Use GitHub's private vulnerability reporting 
 
 ## Design commitments
 
-- **Pairing** happens only while "Add computer" is open (a TCP listener on port 4243 exists only then, home addresses only), using SPAKE2 over a 6-digit code typed on the other device. Three wrong codes lock pairing for 5 minutes.
+- **Pairing** happens only while "Add computer" is open (a TCP listener on port 4243 exists only then, home addresses only, one guest at a time) and needs a click on **both** computers. Both screens show a 6-digit code derived from both device keys and fresh random nonces; the guest commits to its nonce before seeing the host's, so a man in the middle gets one 1-in-1,000,000 chance per attempt and otherwise shows a mismatched code. Each side then signs the exchange with its identity key. (Typed-code pairing over SPAKE2, with a lockout after three wrong codes, remains in the library for devices that can't show a confirmation.)
 - **Identity keys** (Ed25519) are planned to live in the OS key store: Windows DPAPI, macOS Keychain, Linux Secret Service, Android Keystore, iOS Secure Enclave. Today's Linux build keeps the key in `~/.config/hopwyn/identity` with mode 0600 and refuses to start if other users can read it.
 - **Transport** is QUIC with TLS 1.3 only, mutual authentication with pinned device keys, and fresh session keys per connection. There is no plaintext or downgrade mode.
 - **No session resumption or 0-RTT.** Every connection does a full handshake against the current trust list, so a forgotten device cannot slip back in on a cached session.
