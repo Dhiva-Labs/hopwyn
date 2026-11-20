@@ -90,6 +90,8 @@ pub enum UiEvent {
     PairingDone(String),
     PairingFailed(String),
     Error(String),
+    /// The service stopped; commands no longer work.
+    Fatal(String),
 }
 
 /// Starts the service on its own thread.
@@ -99,7 +101,7 @@ pub fn spawn(ui: async_channel::Sender<UiEvent>) -> mpsc::UnboundedSender<Comman
         .name("hopwyn-service".into())
         .spawn(move || {
             if let Err(e) = run(&ui, rx) {
-                let _ = ui.send_blocking(UiEvent::Error(e));
+                let _ = ui.send_blocking(UiEvent::Fatal(e));
             }
         })
         .ok();
@@ -120,7 +122,11 @@ fn run(
         "Allow Hopwyn to capture input in the desktop's dialog".into(),
     ));
     let edge = partner.as_ref().map_or(Edge::Right, |p| p.edge);
-    let (capture, capture_rx) = LinuxCapture::start(edge).map_err(|e| e.to_string())?;
+    let (capture, capture_rx) =
+        LinuxCapture::start_with_token(edge, store.capture_token()).map_err(|e| e.to_string())?;
+    if let Some(t) = capture.restore_token() {
+        let _ = store.save_capture_token(t);
+    }
 
     // The remote-control permission: ask once, then reuse the desktop's token.
     let mut token = store.restore_token();
@@ -143,7 +149,8 @@ fn run(
     });
 
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-    rt.block_on(
+    // Service::new opens sockets, so it must run inside the runtime.
+    rt.block_on(async move {
         Service::new(
             ui.clone(),
             store,
@@ -153,8 +160,9 @@ fn run(
             capture,
             capture_rx,
         )?
-        .run(cmds),
-    )
+        .run(cmds)
+        .await
+    })
 }
 
 /// Everything the main loop reacts to besides UI commands.
@@ -291,19 +299,19 @@ impl Service {
                     continue;
                 };
                 let addr = addresses.lock().ok().and_then(|m| m.get(&p.id).copied());
-                if let Some(addr) = addr {
-                    if let Ok(conn) = node.connect(addr).await {
-                        if conn.peer() == p.id {
-                            if hand_over(conn, &dial_tx).is_err() {
-                                return;
-                            }
-                            if redial_rx.recv().await.is_none() {
-                                return;
-                            }
-                            continue;
+                if let Some(addr) = addr
+                    && let Ok(conn) = node.connect(addr).await
+                {
+                    if conn.peer() == p.id {
+                        if hand_over(conn, &dial_tx).is_err() {
+                            return;
                         }
-                        conn.close();
+                        if redial_rx.recv().await.is_none() {
+                            return;
+                        }
+                        continue;
                     }
+                    conn.close();
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(RETRY) => {}
@@ -470,12 +478,12 @@ impl Service {
             h.abort();
         }
         let mut limiter = std::mem::take(&mut self.limiter);
-        if let Err(e) = limiter.check(Instant::now()) {
-            if !matches!(e, hopwyn_pair::LimiterError::WindowClosed) {
-                self.limiter = limiter;
-                self.send_ui(UiEvent::PairingFailed(e.to_string()));
-                return;
-            }
+        if let Err(e) = limiter.check(Instant::now())
+            && !matches!(e, hopwyn_pair::LimiterError::WindowClosed)
+        {
+            self.limiter = limiter;
+            self.send_ui(UiEvent::PairingFailed(e.to_string()));
+            return;
         }
         limiter.open(Instant::now());
         let code = PairingCode::generate();
@@ -542,10 +550,10 @@ impl Service {
         for action in self.engine.handle(input, Instant::now()) {
             match action {
                 Action::Send(m) => {
-                    if let Some(s) = self.sender.as_mut() {
-                        if s.send(&m).await.is_err() {
-                            lost = true;
-                        }
+                    if let Some(s) = self.sender.as_mut()
+                        && s.send(&m).await.is_err()
+                    {
+                        lost = true;
                     }
                 }
                 Action::Inject(ev) => {
@@ -586,11 +594,11 @@ impl Service {
             let restore = self.token.clone();
             match tokio::task::block_in_place(|| LinuxEmulator::connect(restore.as_deref())) {
                 Ok(e) => {
-                    if let Some(t) = e.restore_token() {
-                        if self.token.as_deref() != Some(t) {
-                            let _ = self.store.save_restore_token(t);
-                            self.token = Some(t.to_owned());
-                        }
+                    if let Some(t) = e.restore_token()
+                        && self.token.as_deref() != Some(t)
+                    {
+                        let _ = self.store.save_restore_token(t);
+                        self.token = Some(t.to_owned());
                     }
                     self.emulator = Some(e);
                 }

@@ -57,16 +57,35 @@ fn edge_words(edge: Edge) -> &'static str {
     }
 }
 
+/// `--background` starts Hopwyn without showing its window (used at login).
 pub fn run() -> glib::ExitCode {
+    let background = std::env::args().any(|a| a == "--background");
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(|app| {
-        if let Some(win) = app.active_window() {
+    let first = Cell::new(true);
+    app.connect_activate(move |app| {
+        if let Some(win) = app.windows().first() {
             win.present();
             return;
         }
-        build(app);
+        let window = build(app);
+        if !(background && first.get()) {
+            window.present();
+        }
+        first.set(false);
     });
-    app.run()
+    let quit = gtk::gio::SimpleAction::new("quit", None);
+    {
+        let app2 = app.clone();
+        quit.connect_activate(move |_, _| app2.quit());
+    }
+    app.add_action(&quit);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
+    // Keep running with no window open, so the link and the desktop's
+    // permissions stay alive and the dialogs are not asked again.
+    let _hold = app.hold();
+    // GTK must not see our own flags.
+    let argv0: Vec<String> = std::env::args().take(1).collect();
+    app.run_with_args(&argv0)
 }
 
 struct Ui {
@@ -91,10 +110,11 @@ struct Ui {
     partner: RefCell<Option<Partner>>,
     status: RefCell<(Link, Control)>,
     ready: Cell<bool>,
+    failed: Cell<bool>,
     updating_side: Cell<bool>,
 }
 
-fn build(app: &adw::Application) {
+fn build(app: &adw::Application) -> adw::ApplicationWindow {
     if let Some(display) = gtk::gdk::Display::default() {
         let css = gtk::CssProvider::new();
         css.load_from_data(CSS);
@@ -122,6 +142,14 @@ fn build(app: &adw::Application) {
     let header = adw::HeaderBar::new();
     let window_title = adw::WindowTitle::new("Hopwyn", "");
     header.set_title_widget(Some(&window_title));
+    let menu = gtk::gio::Menu::new();
+    menu.append(Some("Quit Hopwyn"), Some("app.quit"));
+    let menu_button = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&menu)
+        .tooltip_text("Menu")
+        .build();
+    header.pack_end(&menu_button);
     let banner = adw::Banner::new("");
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -224,7 +252,13 @@ fn build(app: &adw::Application) {
         .subtitle("Encrypted, home network only, no account or cloud")
         .build();
     tip_private.add_prefix(&gtk::Image::from_icon_name("security-high-symbolic"));
+    let tip_background = adw::ActionRow::builder()
+        .title("Keeps working when closed")
+        .subtitle("Closing this window leaves Hopwyn running. Quit from the menu or with Ctrl + Q")
+        .build();
+    tip_background.add_prefix(&gtk::Image::from_icon_name("window-close-symbolic"));
     tips.add(&tip_panic);
+    tips.add(&tip_background);
     tips.add(&tip_private);
 
     let content = gtk::Box::builder()
@@ -275,6 +309,7 @@ fn build(app: &adw::Application) {
         partner: RefCell::new(None),
         status: RefCell::new((Link::NoPartner, Control::Local)),
         ready: Cell::new(false),
+        failed: Cell::new(false),
         updating_side: Cell::new(false),
     });
 
@@ -300,9 +335,13 @@ fn build(app: &adw::Application) {
     }
     {
         let ui2 = ui.clone();
-        window.connect_close_request(move |_| {
+        // Closing hides the window; Hopwyn keeps running.
+        window.connect_close_request(move |w| {
+            w.set_visible(false);
+            glib::Propagation::Stop
+        });
+        app.connect_shutdown(move |_| {
             let _ = ui2.cmd.send(Command::Quit);
-            glib::Propagation::Proceed
         });
     }
     {
@@ -314,11 +353,14 @@ fn build(app: &adw::Application) {
         });
     }
 
-    window.present();
+    window
 }
 
 impl Ui {
     fn handle(self: &Rc<Self>, ev: UiEvent) {
+        if matches!(ev, UiEvent::Fatal(_)) {
+            self.failed.set(true);
+        }
         match ev {
             UiEvent::Waiting(text) => {
                 self.banner.set_title(&format!(
@@ -358,7 +400,7 @@ impl Ui {
                 self.close_code_dialog();
                 self.toast(&format!("Pairing failed: {why}"));
             }
-            UiEvent::Error(e) => {
+            UiEvent::Error(e) | UiEvent::Fatal(e) => {
                 self.banner.set_revealed(false);
                 self.set_card(
                     "dialog-error-symbolic",
@@ -515,6 +557,9 @@ impl Ui {
     }
 
     fn show_code_dialog(self: &Rc<Self>) {
+        if !self.check_ready() {
+            return;
+        }
         if self.partner.borrow().is_some() {
             let dialog = adw::AlertDialog::new(
                 Some("Replace the paired computer?"),
@@ -560,8 +605,10 @@ impl Ui {
         dialog.set_close_response("cancel");
         let ui = self.clone();
         dialog.connect_response(None, move |_, response| {
-            if response == "cancel" {
-                ui.code_dialog.borrow_mut().take();
+            // Still stored means the user cancelled; close_code_dialog
+            // takes it out first, so closing on success doesn't cancel.
+            let user_cancelled = ui.code_dialog.borrow_mut().take().is_some();
+            if response == "cancel" && user_cancelled {
                 let _ = ui.cmd.send(Command::CancelPairing);
             }
         });
@@ -570,12 +617,31 @@ impl Ui {
     }
 
     fn close_code_dialog(&self) {
-        if let Some(d) = self.code_dialog.borrow_mut().take() {
+        // Release the borrow before closing: force_close runs the response
+        // handler, which borrows code_dialog too.
+        let dialog = self.code_dialog.borrow_mut().take();
+        if let Some(d) = dialog {
             d.force_close();
         }
     }
 
+    /// Whether the service can act on commands; tells the user why not.
+    fn check_ready(&self) -> bool {
+        if self.failed.get() {
+            self.toast("Hopwyn stopped because of the error above. Quit and open it again");
+            return false;
+        }
+        if !self.ready.get() {
+            self.toast("Allow the desktop's permission dialog first (press Super to find it)");
+            return false;
+        }
+        true
+    }
+
     fn show_join_dialog(self: &Rc<Self>, name: &str, ip: IpAddr) {
+        if !self.check_ready() {
+            return;
+        }
         let entry = gtk::Entry::builder()
             .placeholder_text("123 456")
             .input_purpose(gtk::InputPurpose::Digits)

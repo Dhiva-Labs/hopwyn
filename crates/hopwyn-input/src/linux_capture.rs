@@ -12,10 +12,12 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use ashpd::desktop::PersistMode;
 use ashpd::desktop::Session;
 use ashpd::desktop::input_capture::{
-    Barrier, BarrierPosition, Capabilities, ConnectToEISOptions, CreateSessionOptions,
-    EnableOptions, GetZonesOptions, InputCapture, ReleaseOptions, SetPointerBarriersOptions,
+    Barrier, BarrierPosition, Capabilities, ConnectToEISOptions, CreateSession2Options,
+    CreateSessionOptions, EnableOptions, GetZonesOptions, InputCapture, ReleaseOptions,
+    SetPointerBarriersOptions, StartOptions,
 };
 use futures_util::StreamExt;
 use hopwyn_proto::Edge;
@@ -49,12 +51,24 @@ enum Command {
 pub struct LinuxCapture {
     tx: mpsc::UnboundedSender<Command>,
     layout: Arc<Mutex<Vec<Rect>>>,
+    restore_token: Option<String>,
 }
 
 impl LinuxCapture {
     /// Starts capturing at `edge` of this desktop. Blocks until the portal
     /// session is set up. Events arrive on the returned channel.
     pub fn start(edge: Edge) -> Result<(Self, std_mpsc::Receiver<CaptureEvent>), InputError> {
+        Self::start_with_token(edge, None)
+    }
+
+    /// Like [`LinuxCapture::start`], but on desktops whose portal can
+    /// remember the permission (InputCapture version 2), passes `token` so
+    /// the dialog is skipped, and asks the desktop to remember the answer.
+    /// The new token is available from [`LinuxCapture::restore_token`].
+    pub fn start_with_token(
+        edge: Edge,
+        token: Option<String>,
+    ) -> Result<(Self, std_mpsc::Receiver<CaptureEvent>), InputError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let layout = Arc::new(Mutex::new(Vec::new()));
         let layout_task = layout.clone();
@@ -74,12 +88,25 @@ impl LinuxCapture {
                         return;
                     }
                 };
-                rt.block_on(run(edge, rx, events_tx, ready_tx, layout_task));
+                rt.block_on(run(edge, token, rx, events_tx, ready_tx, layout_task));
             })
             .map_err(|e| InputError::Ei(e.to_string()))?;
 
-        ready_rx.recv().map_err(|_| InputError::Closed)??;
-        Ok((Self { tx, layout }, events_rx))
+        let restore_token = ready_rx.recv().map_err(|_| InputError::Closed)??;
+        Ok((
+            Self {
+                tx,
+                layout,
+                restore_token,
+            },
+            events_rx,
+        ))
+    }
+
+    /// The token that skips the permission dialog next time, if the
+    /// desktop can remember it.
+    pub fn restore_token(&self) -> Option<&str> {
+        self.restore_token.as_deref()
     }
 
     /// The desktop's screens, as the desktop reported them for capture.
@@ -118,7 +145,7 @@ impl LinuxCapture {
     }
 }
 
-type Ready = std_mpsc::Sender<Result<(), InputError>>;
+type Ready = std_mpsc::Sender<Result<Option<String>, InputError>>;
 
 fn portal(e: ashpd::Error) -> InputError {
     InputError::Portal(e.to_string())
@@ -195,6 +222,7 @@ fn trace(step: &str) {
 
 async fn run(
     edge: Edge,
+    token: Option<String>,
     mut rx: mpsc::UnboundedReceiver<Command>,
     out: std_mpsc::Sender<CaptureEvent>,
     ready: Ready,
@@ -210,15 +238,39 @@ async fn run(
     let setup = async {
         // This step waits for the user to answer GNOME's permission dialog.
         trace("create_session (waiting for the permission dialog)");
-        let create = ic.create_session(
-            None,
-            CreateSessionOptions::default()
-                .set_capabilities(Capabilities::Keyboard | Capabilities::Pointer),
-        );
-        let (session, _caps) = tokio::time::timeout(PERMISSION_TIMEOUT, create)
+        let caps = Capabilities::Keyboard | Capabilities::Pointer;
+        let create = async {
+            if ic.version() >= 2 {
+                // Version 2 can remember the answer, so later launches skip the dialog.
+                let session = ic
+                    .create_session2(CreateSession2Options::default())
+                    .await
+                    .map_err(portal)?;
+                let started = ic
+                    .start(
+                        &session,
+                        None,
+                        StartOptions::default()
+                            .set_capabilities(caps)
+                            .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                            .set_restore_token(token.clone()),
+                    )
+                    .await
+                    .map_err(portal)?
+                    .response()
+                    .map_err(portal)?;
+                Ok::<_, InputError>((session, started.restore_token().map(str::to_owned)))
+            } else {
+                let (session, _caps) = ic
+                    .create_session(None, CreateSessionOptions::default().set_capabilities(caps))
+                    .await
+                    .map_err(portal)?;
+                Ok((session, None))
+            }
+        };
+        let (session, new_token) = tokio::time::timeout(PERMISSION_TIMEOUT, create)
             .await
-            .map_err(|_| InputError::Portal("the permission dialog was not answered".into()))?
-            .map_err(portal)?;
+            .map_err(|_| InputError::Portal("the permission dialog was not answered".into()))??;
         trace("connect_to_eis");
         let fd = ic
             .connect_to_eis(&session, ConnectToEISOptions::default())
@@ -250,21 +302,31 @@ async fn run(
             disabled,
             zones_changed,
             rects,
+            new_token,
         ))
     };
 
-    let (session, conn, events, activated, deactivated, disabled, zones_changed, mut rects) =
-        match setup.await {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = ready.send(Err(e));
-                return;
-            }
-        };
+    let (
+        session,
+        conn,
+        events,
+        activated,
+        deactivated,
+        disabled,
+        zones_changed,
+        mut rects,
+        new_token,
+    ) = match setup.await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
     if let Ok(mut l) = layout.lock() {
         l.clone_from(&rects);
     }
-    if ready.send(Ok(())).is_err() {
+    if ready.send(Ok(new_token)).is_err() {
         return;
     }
     tokio::pin!(events, activated, deactivated, disabled, zones_changed);
@@ -365,9 +427,8 @@ async fn run(
                     EiEvent::Button(b) => {
                         let pressed = b.state == ei::button::ButtonState::Press;
                         let code = u16::try_from(b.button).unwrap_or(0);
-                        if let Some(ev) = translator.button(code, pressed) {
-                            if !send(CaptureEvent::Input(ev)) { break }
-                        }
+                        if let Some(ev) = translator.button(code, pressed)
+                            && !send(CaptureEvent::Input(ev)) { break }
                     }
                     EiEvent::ScrollDiscrete(s) => {
                         #[allow(clippy::cast_precision_loss)]
@@ -391,19 +452,19 @@ async fn run(
             }
         }
 
-        if let Some(reason) = release_now {
-            if let Some((id, hit)) = active.take() {
-                for ev in translator.release_all() {
-                    let _ = send(CaptureEvent::Input(ev));
-                }
-                let position = release_pos.unwrap_or(hit);
-                let opts = ReleaseOptions::default()
-                    .set_activation_id(id)
-                    .set_cursor_position(release_point(&rects, edge, position, RELEASE_INSET));
-                let _ = ic.release(&session, opts).await;
-                if !send(CaptureEvent::Released(reason)) {
-                    break;
-                }
+        if let Some(reason) = release_now
+            && let Some((id, hit)) = active.take()
+        {
+            for ev in translator.release_all() {
+                let _ = send(CaptureEvent::Input(ev));
+            }
+            let position = release_pos.unwrap_or(hit);
+            let opts = ReleaseOptions::default()
+                .set_activation_id(id)
+                .set_cursor_position(release_point(&rects, edge, position, RELEASE_INSET));
+            let _ = ic.release(&session, opts).await;
+            if !send(CaptureEvent::Released(reason)) {
+                break;
             }
         }
     }

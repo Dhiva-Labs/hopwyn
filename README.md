@@ -11,17 +11,17 @@ One mouse and keyboard for every computer and phone in your home. Move the curso
 
 ## Install (Linux)
 
-Requires Rust 1.85+ and the GTK 4 / libadwaita development files (`sudo apt install libgtk-4-dev libadwaita-1-dev` on Ubuntu).
+Requires Rust 1.88+ and the GTK 4 / libadwaita development files (`sudo apt install libgtk-4-dev libadwaita-1-dev` on Ubuntu).
 
 ```bash
-scripts/install-linux.sh              # builds and installs for your user, no sudo
-scripts/install-linux.sh --autostart  # also start Hopwyn when you log in
+scripts/install-linux.sh                 # builds and installs for your user, no sudo; starts at login
+scripts/install-linux.sh --no-autostart  # don't start Hopwyn at login
 scripts/install-linux.sh --uninstall
 ```
 
 Then open **Hopwyn** from your app launcher on both computers:
 
-1. Allow the two desktop permission dialogs (capture input, then remote control). The remote-control permission is remembered.
+1. Allow the two desktop permission dialogs (capture input, then remote control). Remote control is asked only once. GNOME 50 and older can't remember the capture permission, so it is asked once each time you log in; Hopwyn keeps running when you close its window so it isn't asked again. Desktops with InputCapture portal version 2 remember it too.
 2. On one computer click **Add computer**; it shows a 6-digit code for 2 minutes.
 3. On the other, pick that computer under **Nearby**, click **Pair…** and type the code.
 4. Choose which side the other screen is on, then move the cursor off that edge.
@@ -71,7 +71,7 @@ The identity key is kept in `~/.config/hopwyn/identity` (mode 0600) until the OS
 
 ## Building
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.88 or newer.
 
 ```bash
 cargo test --workspace

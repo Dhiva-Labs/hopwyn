@@ -35,8 +35,8 @@ fn parse_id(s: &str) -> Option<DeviceId> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
-        let pair = std::str::from_utf8(pair).ok()?;
+    for (slot, pair) in out.iter_mut().zip(s.as_bytes().as_chunks::<2>().0) {
+        let pair = std::str::from_utf8(pair.as_slice()).ok()?;
         *slot = u8::from_str_radix(pair, 16).ok()?;
     }
     Some(DeviceId::from_bytes(out))

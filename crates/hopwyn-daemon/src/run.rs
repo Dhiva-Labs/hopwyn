@@ -175,14 +175,14 @@ async fn event_loop(
         let (addr_tx, addr_rx) = std_mpsc::channel::<SocketAddr>();
         std::thread::spawn(move || {
             while let Ok(ev) = found.recv() {
-                if let DiscoveryEvent::Found(d) = ev {
-                    if d.id == peer {
-                        // The node is bound to IPv4, and IPv6 link-local
-                        // addresses need an interface scope mDNS doesn't
-                        // give us, so dial the peer's IPv4 address.
-                        if let Some(a) = d.addrs.into_iter().find(SocketAddr::is_ipv4) {
-                            let _ = addr_tx.send(a);
-                        }
+                if let DiscoveryEvent::Found(d) = ev
+                    && d.id == peer
+                {
+                    // The node is bound to IPv4, and IPv6 link-local
+                    // addresses need an interface scope mDNS doesn't
+                    // give us, so dial the peer's IPv4 address.
+                    if let Some(a) = d.addrs.into_iter().find(SocketAddr::is_ipv4) {
+                        let _ = addr_tx.send(a);
                     }
                 }
             }
@@ -279,10 +279,10 @@ async fn event_loop(
         for action in engine.handle(input, Instant::now()) {
             match action {
                 Action::Send(m) => {
-                    if let Some(s) = sender.as_mut() {
-                        if s.send(&m).await.is_err() {
-                            lost = true;
-                        }
+                    if let Some(s) = sender.as_mut()
+                        && s.send(&m).await.is_err()
+                    {
+                        lost = true;
                     }
                 }
                 Action::Inject(ev) => {

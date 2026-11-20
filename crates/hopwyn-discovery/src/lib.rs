@@ -137,10 +137,10 @@ fn pump(
             }
             _ => None,
         };
-        if let Some(e) = out {
-            if tx.send(e).is_err() {
-                return;
-            }
+        if let Some(e) = out
+            && tx.send(e).is_err()
+        {
+            return;
         }
     }
 }

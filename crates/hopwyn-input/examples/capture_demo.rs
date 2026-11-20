@@ -33,11 +33,11 @@ fn main() {
     let (mut motion, mut keys, mut buttons, mut scrolls) = (0u32, 0u32, 0u32, 0u32);
 
     while Instant::now() < end {
-        if let Some(t) = captured_since {
-            if t.elapsed() >= Duration::from_secs(5) {
-                let _ = capture.release();
-                captured_since = None;
-            }
+        if let Some(t) = captured_since
+            && t.elapsed() >= Duration::from_secs(5)
+        {
+            let _ = capture.release();
+            captured_since = None;
         }
         match events.recv_timeout(Duration::from_millis(100)) {
             Ok(CaptureEvent::Activated { position }) => {

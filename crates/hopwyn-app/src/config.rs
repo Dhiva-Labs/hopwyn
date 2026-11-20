@@ -92,6 +92,19 @@ impl Store {
     pub fn save_restore_token(&self, token: &str) -> Result<(), String> {
         write_private(&self.dir.join("restore-token"), token.as_bytes())
     }
+
+    /// The input-capture permission token, on desktops that can remember it.
+    pub fn capture_token(&self) -> Option<String> {
+        let bytes = read_private(&self.dir.join("capture-token")).ok()??;
+        String::from_utf8(bytes)
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn save_capture_token(&self, token: &str) -> Result<(), String> {
+        write_private(&self.dir.join("capture-token"), token.as_bytes())
+    }
 }
 
 /// Reads a file that must not be readable by other users. `None` if missing.
@@ -156,8 +169,8 @@ pub fn parse_hex_id(s: &str) -> Option<DeviceId> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
-        *slot = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    for (slot, pair) in out.iter_mut().zip(s.as_bytes().as_chunks::<2>().0) {
+        *slot = u8::from_str_radix(std::str::from_utf8(pair.as_slice()).ok()?, 16).ok()?;
     }
     Some(DeviceId::from_bytes(out))
 }

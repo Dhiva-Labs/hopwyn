@@ -21,11 +21,11 @@ fn two_devices_find_each_other() {
         |rx: &std::sync::mpsc::Receiver<DiscoveryEvent>, want: hopwyn_pair::DeviceId, port: u16| {
             let deadline = Instant::now() + Duration::from_secs(15);
             while Instant::now() < deadline {
-                if let Ok(DiscoveryEvent::Found(d)) = rx.recv_timeout(Duration::from_millis(500)) {
-                    if d.id == want {
-                        assert!(d.addrs.iter().all(|s| s.port() == port));
-                        return d;
-                    }
+                if let Ok(DiscoveryEvent::Found(d)) = rx.recv_timeout(Duration::from_millis(500))
+                    && d.id == want
+                {
+                    assert!(d.addrs.iter().all(|s| s.port() == port));
+                    return d;
                 }
             }
             panic!("device not found within 15 s");

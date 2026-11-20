@@ -74,8 +74,8 @@ pub fn parse_hex_id(s: &str) -> Option<hopwyn_pair::DeviceId> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
-        *slot = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    for (slot, pair) in out.iter_mut().zip(s.as_bytes().as_chunks::<2>().0) {
+        *slot = u8::from_str_radix(std::str::from_utf8(pair.as_slice()).ok()?, 16).ok()?;
     }
     Some(hopwyn_pair::DeviceId::from_bytes(out))
 }
