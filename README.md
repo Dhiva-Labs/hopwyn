@@ -24,7 +24,7 @@ Then open **Hopwyn** from your app launcher on both computers:
 1. Allow the two desktop permission dialogs (capture input, then remote control). Remote control is asked only once. GNOME 50 and older can't remember the capture permission, so it is asked once each time you log in; Hopwyn keeps running when you close its window so it isn't asked again. Desktops with InputCapture portal version 2 remember it too.
 2. On one computer click **Add computer** (it stays open for 2 minutes).
 3. The other computer pops up a pairing dialog on its own within a few seconds. Check both screens show the same 6-digit code and click **Pair** on both. (If you dismissed it, click **Pair** next to the computer under **Nearby**.)
-4. Choose which side the other screen is on, then move the cursor off that edge. Repeat with **Add computer** for up to 4 computers, one on each side.
+4. In the layout picture, drag the other computer (or click it, then click a side) to where its screen really is; the other computer updates to match. Then move the cursor off that edge. Repeat with **Add computer** for up to 4 computers, one on each side.
 
 **Ctrl+Alt+Esc** always gives your cursor back. The firewall must allow UDP 4242 (link), UDP 5353 (discovery) and, while pairing, TCP 4243 between the computers.
 

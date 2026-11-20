@@ -62,6 +62,10 @@ pub enum Message {
     Key { code: u16, pressed: bool },
     /// New clipboard text from the sender.
     ClipboardText { text: String },
+    /// Layout: the receiver's screen sits beyond the sender's `edge`, so the
+    /// receiver places the sender beyond the opposite edge. Keeps both
+    /// computers' arrangement in step when it changes on either.
+    Layout { edge: Edge },
     /// Keep-alive. Three missed heartbeats end the handoff.
     Heartbeat { seq: u32 },
     /// Orderly shutdown of the connection.

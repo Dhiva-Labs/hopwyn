@@ -277,6 +277,8 @@ fn capture_edges(partners: &[Partner]) -> Vec<Edge> {
 /// Everything the main loop reacts to besides UI commands.
 enum Internal {
     Capture(CaptureEvent),
+    /// Screen-edge capture stopped (the desktop ended the session).
+    CaptureEnded,
     /// A link to a paired computer is up.
     Connected(DeviceId, PeerSender, mpsc::UnboundedReceiver<Message>),
     /// A message on a link; the number tells a link's messages apart from
@@ -378,9 +380,10 @@ impl Service {
         std::thread::spawn(move || {
             while let Ok(ev) = capture_rx.recv() {
                 if cap_tx.send(Internal::Capture(ev)).is_err() {
-                    break;
+                    return;
                 }
             }
+            let _ = cap_tx.send(Internal::CaptureEnded);
         });
 
         // Discovery: keep the nearby list and paired computers' addresses current.
@@ -562,7 +565,7 @@ impl Service {
                 }
                 cmd = cmds.recv() => match cmd {
                     None | Some(Command::Quit) => break,
-                    Some(c) => self.on_command(c),
+                    Some(c) => self.on_command(c).await,
                 },
                 ev = self.rx.recv() => match ev {
                     None => break,
@@ -583,6 +586,15 @@ impl Service {
     async fn on_internal(&mut self, ev: Internal) {
         match ev {
             Internal::Capture(c) => self.on_capture(c).await,
+            Internal::CaptureEnded => {
+                if self.capture.0.is_some() {
+                    self.debug("capture ended");
+                    self.send_ui(UiEvent::Error(
+                        "The desktop stopped input sharing. Quit Hopwyn (Ctrl+Q) and open it again."
+                            .into(),
+                    ));
+                }
+            }
             Internal::PeerMessage(id, generation, m) => {
                 let Some(i) = self.peer_index(&id) else {
                     return;
@@ -596,6 +608,16 @@ impl Service {
                     if let Some(s) = self.peers.get_mut(i).and_then(|p| p.sender.as_mut()) {
                         let _ = s.send(&Message::Leave).await;
                     }
+                    return;
+                }
+                // The other computer was rearranged: mirror it here.
+                if let Message::Layout { edge } = m {
+                    let theirs = hopwyn_core::opposite(edge);
+                    self.debug(&format!(
+                        "{} says it is beyond my {theirs:?} edge",
+                        self.name(i)
+                    ));
+                    let _ = self.set_edge(id, theirs);
                     return;
                 }
                 self.step(i, Input::Peer(m)).await;
@@ -630,6 +652,11 @@ impl Service {
                 });
                 self.debug(&format!("connected to {}", self.name(i)));
                 self.step(i, Input::PeerConnected).await;
+                // One side's arrangement wins on connect (the lower key), so
+                // a pair can never disagree about which edges face.
+                if self.identity.id().as_bytes() < id.as_bytes() {
+                    self.send_layout(i).await;
+                }
             }
             Internal::PeerGone(id, generation) => {
                 let Some(i) = self.peer_index(&id) else {
@@ -805,7 +832,7 @@ impl Service {
         }
     }
 
-    fn on_command(&mut self, cmd: Command) {
+    async fn on_command(&mut self, cmd: Command) {
         match cmd {
             Command::AddDevice => self.start_hosting(),
             Command::CancelPairing => self.cancel_pairing(),
@@ -823,27 +850,10 @@ impl Service {
                 }
             }
             Command::SetEdge { id, edge } => {
-                let Some(i) = self.peer_index(&id) else {
-                    return;
-                };
-                let Some(old) = self.peers.get(i).map(|p| p.partner.edge) else {
-                    return;
-                };
-                if old == edge {
-                    return;
+                // Moved here by the user: tell the computers that moved.
+                for moved in self.set_edge(id, edge) {
+                    self.send_layout(moved).await;
                 }
-                // Whoever was on that side moves to this one's old side.
-                if let Some(j) = self.peers.iter().position(|p| p.partner.edge == edge) {
-                    if let Some(p) = self.peers.get_mut(j) {
-                        p.partner.edge = old;
-                    }
-                    self.reset_engine(j);
-                }
-                if let Some(p) = self.peers.get_mut(i) {
-                    p.partner.edge = edge;
-                }
-                self.reset_engine(i);
-                self.partners_changed();
             }
             Command::Forget(id) => {
                 let Some(i) = self.peer_index(&id) else {
@@ -868,6 +878,47 @@ impl Service {
                 self.publish_nearby();
             }
             Command::Quit => {}
+        }
+    }
+
+    /// Places computer `id` beyond `edge`; whoever was there takes its old
+    /// side. Returns the computers whose side changed.
+    fn set_edge(&mut self, id: DeviceId, edge: Edge) -> Vec<usize> {
+        let Some(i) = self.peer_index(&id) else {
+            return Vec::new();
+        };
+        let Some(old) = self.peers.get(i).map(|p| p.partner.edge) else {
+            return Vec::new();
+        };
+        if old == edge {
+            return Vec::new();
+        }
+        let mut moved = vec![i];
+        if let Some(j) = self.peers.iter().position(|p| p.partner.edge == edge) {
+            if let Some(p) = self.peers.get_mut(j) {
+                p.partner.edge = old;
+            }
+            self.reset_engine(j);
+            moved.push(j);
+        }
+        if let Some(p) = self.peers.get_mut(i) {
+            p.partner.edge = edge;
+        }
+        self.reset_engine(i);
+        self.partners_changed();
+        moved
+    }
+
+    /// Tells peer `i` where it sits, so its arrangement matches this one.
+    async fn send_layout(&mut self, i: usize) {
+        let Some(peer) = self.peers.get_mut(i) else {
+            return;
+        };
+        let msg = Message::Layout {
+            edge: peer.partner.edge,
+        };
+        if let Some(s) = peer.sender.as_mut() {
+            let _ = s.send(&msg).await;
         }
     }
 

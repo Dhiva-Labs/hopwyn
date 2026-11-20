@@ -17,8 +17,8 @@ use ashpd::desktop::PersistMode;
 use ashpd::desktop::Session;
 use ashpd::desktop::input_capture::{
     ActivatedBarrier, Barrier, BarrierPosition, Capabilities, ConnectToEISOptions,
-    CreateSession2Options, CreateSessionOptions, EnableOptions, GetZonesOptions, InputCapture,
-    ReleaseOptions, SetPointerBarriersOptions, StartOptions,
+    CreateSession2Options, CreateSessionOptions, DisableOptions, EnableOptions, GetZonesOptions,
+    InputCapture, ReleaseOptions, SetPointerBarriersOptions, StartOptions,
 };
 use futures_util::StreamExt;
 use hopwyn_proto::Edge;
@@ -167,6 +167,33 @@ type Ready = std_mpsc::Sender<Result<Option<String>, InputError>>;
 
 fn portal(e: ashpd::Error) -> InputError {
     InputError::Portal(e.to_string())
+}
+
+/// Moves the barriers (to new edges, or after the screens changed). The
+/// desktop only accepts new barriers while capture is off, so: disable,
+/// set, enable. On failure capture keeps running with the old barriers
+/// (and logs why) rather than ending.
+async fn rearm(
+    ic: &InputCapture,
+    session: &Session<InputCapture>,
+    edges: &[Edge],
+    ids: &mut HashMap<u32, Edge>,
+) -> Option<Vec<Rect>> {
+    if let Err(e) = ic.disable(session, DisableOptions::default()).await {
+        trace(&format!("disable failed: {e}"));
+    }
+    let rects = match zones_and_barriers(ic, session, edges, ids).await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            trace(&format!("setting barriers failed: {e}"));
+            None
+        }
+    };
+    match ic.enable(session, EnableOptions::default()).await {
+        Ok(_) => trace("enabled"),
+        Err(e) => trace(&format!("enable failed: {e}")),
+    }
+    rects
 }
 
 async fn zones_and_barriers(
@@ -408,16 +435,12 @@ async fn run(
             }
             z = zones_changed.next() => {
                 if z.is_none() { break }
-                match zones_and_barriers(&ic, &session, &edges, &mut ids).await {
-                    Ok(r) => {
-                        rects = r;
-                        if let Ok(mut l) = layout.lock() {
-                            l.clone_from(&rects);
-                        }
+                if let Some(r) = rearm(&ic, &session, &edges, &mut ids).await {
+                    rects = r;
+                    if let Ok(mut l) = layout.lock() {
+                        l.clone_from(&rects);
                     }
-                    Err(_) => { let _ = send(CaptureEvent::Disabled); break }
                 }
-                let _ = ic.enable(&session, EnableOptions::default()).await;
             }
             cmd = rx.recv() => match cmd {
                 Some(Command::Release(pos)) => {
@@ -427,20 +450,18 @@ async fn run(
                 Some(Command::SetEdges(new_edges)) => {
                     trace("move barriers");
                     edges = new_edges;
-                    match zones_and_barriers(&ic, &session, &edges, &mut ids).await {
-                        Ok(r) => {
-                            rects = r;
-                            if let Ok(mut l) = layout.lock() {
-                                l.clone_from(&rects);
-                            }
+                    if let Some(r) = rearm(&ic, &session, &edges, &mut ids).await {
+                        rects = r;
+                        if let Ok(mut l) = layout.lock() {
+                            l.clone_from(&rects);
                         }
-                        Err(_) => { let _ = send(CaptureEvent::Disabled); break }
                     }
-                    let _ = ic.enable(&session, EnableOptions::default()).await;
                 }
                 Some(Command::Enable) => {
                     trace("enable");
-                    let _ = ic.enable(&session, EnableOptions::default()).await;
+                    if let Err(e) = ic.enable(&session, EnableOptions::default()).await {
+                        trace(&format!("enable failed: {e}"));
+                    }
                 }
                 None => break,
             },

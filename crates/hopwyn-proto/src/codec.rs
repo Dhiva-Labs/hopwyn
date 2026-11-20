@@ -11,6 +11,7 @@ mod tag {
     pub const SCROLL: u8 = 0x12;
     pub const KEY: u8 = 0x20;
     pub const CLIPBOARD_TEXT: u8 = 0x30;
+    pub const LAYOUT: u8 = 0x40;
     pub const HEARTBEAT: u8 = 0x70;
     pub const DISCONNECT: u8 = 0x7f;
 }
@@ -93,6 +94,10 @@ pub(crate) fn encode(msg: &Message, out: &mut Vec<u8>) {
             out.push(tag::CLIPBOARD_TEXT);
             put_str(out, text);
         }
+        Message::Layout { edge } => {
+            out.push(tag::LAYOUT);
+            out.push(edge_to_u8(*edge));
+        }
         Message::Heartbeat { seq } => {
             out.push(tag::HEARTBEAT);
             out.extend_from_slice(&seq.to_le_bytes());
@@ -135,6 +140,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
         },
         tag::CLIPBOARD_TEXT => Message::ClipboardText {
             text: r.string("clipboard text", MAX_CLIPBOARD_TEXT)?,
+        },
+        tag::LAYOUT => Message::Layout {
+            edge: edge_from_u8(r.u8()?)?,
         },
         tag::HEARTBEAT => Message::Heartbeat { seq: r.u32()? },
         tag::DISCONNECT => Message::Disconnect,
@@ -305,6 +313,7 @@ mod tests {
                 text: String::new(),
             },
             Message::Heartbeat { seq: 42 },
+            Message::Layout { edge: Edge::Top },
             Message::Disconnect,
         ]
     }

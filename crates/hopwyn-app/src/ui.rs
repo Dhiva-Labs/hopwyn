@@ -32,6 +32,8 @@ const CSS: &str = "
 .layout-tile.peer { background: alpha(@card_fg_color, 0.08); }
 .layout-tile.peer.online { background: alpha(@success_color, 0.18); }
 .layout-tile.peer.active { background: alpha(@warning_color, 0.30); }
+.layout-tile.peer.picked { outline: 3px solid @accent_color; outline-offset: 2px; }
+.layout-tile.peer.slot { background: none; border: 2px dashed alpha(@card_fg_color, 0.25); color: alpha(@card_fg_color, 0.5); }
 .pairing-code { font-size: 44px; font-weight: 800; letter-spacing: 6px; font-feature-settings: 'tnum'; }
 ";
 
@@ -130,6 +132,8 @@ struct Ui {
     failed: Cell<bool>,
     /// Started at login: hide the window once setup is done.
     hide_when_ready: Cell<bool>,
+    /// A computer picked in the layout picture, waiting for a side.
+    picked: Cell<Option<DeviceId>>,
 }
 
 fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindow {
@@ -204,7 +208,7 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
     let partner_group = adw::PreferencesGroup::builder()
         .title("Paired computers")
         .description(format!(
-            "Up to {MAX_PARTNERS}, one on each side of this screen. Pick the side each one is on."
+            "Up to {MAX_PARTNERS}, one on each side of this screen. Drag a computer (or click it, then click a side) to where its screen is; the other computer updates too."
         ))
         .build();
     let layout = gtk::Grid::builder()
@@ -364,6 +368,7 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
         ready: Cell::new(false),
         failed: Cell::new(false),
         hide_when_ready: Cell::new(hide_when_ready),
+        picked: Cell::new(None),
     });
 
     {
@@ -388,6 +393,50 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
                 ui2.handle(ev);
             }
         });
+    }
+
+    // Drag a computer's tile to another side to move it there.
+    for (edge, tile) in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+        .into_iter()
+        .zip(ui.layout_tiles.iter())
+    {
+        let source = gtk::DragSource::new();
+        source.set_actions(gtk::gdk::DragAction::MOVE);
+        {
+            let ui2 = ui.clone();
+            source.connect_prepare(move |_, _, _| {
+                let partners = ui2.partners.borrow();
+                let p = partners.iter().find(|p| p.edge == edge)?;
+                Some(gtk::gdk::ContentProvider::for_value(
+                    &crate::config::hex_id(&p.id).to_value(),
+                ))
+            });
+        }
+        tile.add_controller(source);
+        let target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        {
+            let ui2 = ui.clone();
+            target.connect_drop(move |_, value, _, _| {
+                let Some(id) = value
+                    .get::<String>()
+                    .ok()
+                    .and_then(|h| crate::config::parse_hex_id(&h))
+                else {
+                    return false;
+                };
+                let _ = ui2.cmd.send(Command::SetEdge { id, edge });
+                true
+            });
+        }
+        tile.add_controller(target);
+
+        // Or click a computer, then click the side to put it on.
+        let click = gtk::GestureClick::new();
+        {
+            let ui2 = ui.clone();
+            click.connect_released(move |_, _, _, _| ui2.layout_clicked(edge));
+        }
+        tile.add_controller(click);
     }
 
     // Once the window is on screen, hand it to the service so the desktop's
@@ -581,6 +630,28 @@ impl Ui {
         }
     }
 
+    /// A click on the layout picture's tile for `edge`: pick the computer
+    /// there, or move the picked one to this side.
+    fn layout_clicked(&self, edge: Edge) {
+        let here = self
+            .partners
+            .borrow()
+            .iter()
+            .find(|p| p.edge == edge)
+            .map(|p| p.id);
+        match (self.picked.take(), here) {
+            (Some(id), _) if Some(id) != here => {
+                let _ = self.cmd.send(Command::SetEdge { id, edge });
+            }
+            (None, Some(id)) => {
+                self.picked.set(Some(id));
+                self.toast("Now click the side its screen is on");
+            }
+            _ => {}
+        }
+        self.refresh_partner_status();
+    }
+
     /// Updates each paired computer's subtitle and the layout picture.
     fn refresh_partner_status(&self) {
         let (connected, control) = self.status.borrow().clone();
@@ -602,12 +673,20 @@ impl Ui {
             .zip(self.layout_tiles.iter())
         {
             let p = partners.iter().find(|p| p.edge == edge);
-            tile.set_visible(p.is_some());
-            tile.remove_css_class("online");
-            tile.remove_css_class("active");
+            // Empty sides stay visible as drop targets for dragging.
+            for c in ["online", "active", "slot", "picked"] {
+                tile.remove_css_class(c);
+            }
+            if p.is_none() {
+                tile.set_label("Drop here");
+                tile.add_css_class("slot");
+            }
             if let Some(p) = p {
                 tile.set_label(&p.name);
                 let active = matches!(control, Control::Controlling(c) | Control::ControlledBy(c) if c == p.id);
+                if self.picked.get() == Some(p.id) {
+                    tile.add_css_class("picked");
+                }
                 if active {
                     tile.add_css_class("active");
                 } else if connected.contains(&p.id) {
