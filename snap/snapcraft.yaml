@@ -48,11 +48,14 @@ parts:
       - libadwaita-1-dev
     override-pull: |
       craftctl default
-      craftctl set version="$(git describe --tags --always 2>/dev/null || echo 0.1.0)"
+      craftctl set version="0.1.0+git$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     override-build: |
       export PATH="/snap/bin:$HOME/.cargo/bin:$PATH"
-      rustup toolchain install 1.93 --profile minimal
-      cargo +1.93 build --release --locked -p hopwyn-app
+      # The GNOME extension points LD_LIBRARY_PATH at the SDK's libc, which
+      # breaks rustup, cargo and build scripts; libraries are found through
+      # pkg-config instead.
+      env -u LD_LIBRARY_PATH rustup toolchain install 1.93 --profile minimal
+      env -u LD_LIBRARY_PATH cargo +1.93 build --release --locked -p hopwyn-app
       install -Dm755 target/release/hopwyn-app "$CRAFT_PART_INSTALL/bin/hopwyn-app"
       install -Dm644 crates/hopwyn-app/data/app.hopwyn.Hopwyn.desktop \
         "$CRAFT_PART_INSTALL/share/applications/app.hopwyn.Hopwyn.desktop"
