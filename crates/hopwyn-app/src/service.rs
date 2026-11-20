@@ -153,13 +153,25 @@ pub enum UiEvent {
     Fatal(String),
 }
 
-/// Starts the service on its own thread.
-pub fn spawn(ui: async_channel::Sender<UiEvent>) -> mpsc::UnboundedSender<Command> {
+/// How long to wait for the window (to put permission dialogs on top of)
+/// before asking without one, as when Hopwyn starts hidden at login.
+const PARENT_WAIT: Duration = Duration::from_secs(3);
+
+/// Starts the service on its own thread. `parent` delivers the window the
+/// desktop's permission dialogs should sit on (see `LinuxCapture`).
+pub fn spawn(
+    ui: async_channel::Sender<UiEvent>,
+    parent: std::sync::mpsc::Receiver<Option<String>>,
+) -> mpsc::UnboundedSender<Command> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("hopwyn-service".into())
         .spawn(move || {
-            if let Err(e) = run(&ui, rx) {
+            let parent = parent.recv_timeout(PARENT_WAIT).ok().flatten();
+            if debug_on() {
+                eprintln!("[hopwyn {}] dialogs attach to window: {parent:?}", stamp());
+            }
+            if let Err(e) = run(&ui, rx, parent) {
                 let _ = ui.send_blocking(UiEvent::Fatal(e));
             }
         })
@@ -170,6 +182,7 @@ pub fn spawn(ui: async_channel::Sender<UiEvent>) -> mpsc::UnboundedSender<Comman
 fn run(
     ui: &async_channel::Sender<UiEvent>,
     cmds: mpsc::UnboundedReceiver<Command>,
+    parent: Option<String>,
 ) -> Result<(), String> {
     let store = Store::open_default()?;
     let identity = Arc::new(store.identity(&config::device_name())?);
@@ -179,7 +192,7 @@ fn run(
         let (_tx, rx) = std::sync::mpsc::channel();
         (Capture(None), rx, None)
     } else {
-        let (capture, rx, token) = start_input(ui, &store, &partners)?;
+        let (capture, rx, token) = start_input(ui, &store, &partners, parent)?;
         (Capture(Some(capture)), rx, token)
     };
 
@@ -210,6 +223,7 @@ fn start_input(
     ui: &async_channel::Sender<UiEvent>,
     store: &Store,
     partners: &[Partner],
+    parent: Option<String>,
 ) -> Result<
     (
         LinuxCapture,
@@ -223,9 +237,12 @@ fn start_input(
     let _ = ui.send_blocking(UiEvent::Waiting(
         "Allow Hopwyn to capture input in the desktop's dialog".into(),
     ));
-    let (capture, capture_rx) =
-        LinuxCapture::start_with_token(capture_edges(partners), store.capture_token())
-            .map_err(|e| e.to_string())?;
+    let (capture, capture_rx) = LinuxCapture::start_with_token(
+        capture_edges(partners),
+        store.capture_token(),
+        parent.clone(),
+    )
+    .map_err(|e| e.to_string())?;
     if let Some(t) = capture.restore_token() {
         let _ = store.save_capture_token(t);
     }
@@ -236,7 +253,7 @@ fn start_input(
         let _ = ui.send_blocking(UiEvent::Waiting(
             "Allow Hopwyn to control input in the desktop's dialog".into(),
         ));
-        let emu = LinuxEmulator::connect(None).map_err(|e| e.to_string())?;
+        let emu = LinuxEmulator::connect_with_parent(None, parent).map_err(|e| e.to_string())?;
         token = emu.restore_token().map(str::to_owned);
         if let Some(t) = &token {
             let _ = store.save_restore_token(t);

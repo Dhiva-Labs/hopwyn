@@ -59,16 +59,19 @@ impl LinuxCapture {
     /// Starts capturing at `edge` of this desktop. Blocks until the portal
     /// session is set up. Events arrive on the returned channel.
     pub fn start(edge: Edge) -> Result<(Self, std_mpsc::Receiver<CaptureEvent>), InputError> {
-        Self::start_with_token(vec![edge], None)
+        Self::start_with_token(vec![edge], None, None)
     }
 
     /// Like [`LinuxCapture::start`], but on desktops whose portal can
     /// remember the permission (InputCapture version 2), passes `token` so
     /// the dialog is skipped, and asks the desktop to remember the answer.
     /// The new token is available from [`LinuxCapture::restore_token`].
+    /// `parent` (`wayland:<handle>` or `x11:<xid>`) puts the permission
+    /// dialog on top of that window, so it can't open hidden.
     pub fn start_with_token(
         edges: Vec<Edge>,
         token: Option<String>,
+        parent: Option<String>,
     ) -> Result<(Self, std_mpsc::Receiver<CaptureEvent>), InputError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let layout = Arc::new(Mutex::new(Vec::new()));
@@ -89,7 +92,15 @@ impl LinuxCapture {
                         return;
                     }
                 };
-                rt.block_on(run(edges, token, rx, events_tx, ready_tx, layout_task));
+                rt.block_on(run(
+                    edges,
+                    token,
+                    parent,
+                    rx,
+                    events_tx,
+                    ready_tx,
+                    layout_task,
+                ));
             })
             .map_err(|e| InputError::Ei(e.to_string()))?;
 
@@ -235,6 +246,7 @@ fn trace(step: &str) {
 async fn run(
     edges: Vec<Edge>,
     token: Option<String>,
+    parent: Option<String>,
     mut rx: mpsc::UnboundedReceiver<Command>,
     out: std_mpsc::Sender<CaptureEvent>,
     ready: Ready,
@@ -247,6 +259,7 @@ async fn run(
             return;
         }
     };
+    let parent = crate::parent_window(parent.as_deref());
     let mut ids: HashMap<u32, Edge> = HashMap::new();
     let setup = async {
         // This step waits for the user to answer GNOME's permission dialog.
@@ -262,7 +275,7 @@ async fn run(
                 let started = ic
                     .start(
                         &session,
-                        None,
+                        parent.as_ref(),
                         StartOptions::default()
                             .set_capabilities(caps)
                             .set_persist_mode(PersistMode::ExplicitlyRevoked)
@@ -275,7 +288,10 @@ async fn run(
                 Ok::<_, InputError>((session, started.restore_token().map(str::to_owned)))
             } else {
                 let (session, _caps) = ic
-                    .create_session(None, CreateSessionOptions::default().set_capabilities(caps))
+                    .create_session(
+                        parent.as_ref(),
+                        CreateSessionOptions::default().set_capabilities(caps),
+                    )
                     .await
                     .map_err(portal)?;
                 Ok((session, None))

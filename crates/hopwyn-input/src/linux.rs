@@ -37,6 +37,15 @@ impl LinuxEmulator {
     /// desktop's dialog (or the restore token is accepted) and the libei
     /// connection is ready.
     pub fn connect(restore_token: Option<&str>) -> Result<Self, InputError> {
+        Self::connect_with_parent(restore_token, None)
+    }
+
+    /// Like [`connect`](Self::connect), showing the dialog on top of
+    /// `parent` (see `parent_window`), so it can't open hidden.
+    pub fn connect_with_parent(
+        restore_token: Option<&str>,
+        parent: Option<String>,
+    ) -> Result<Self, InputError> {
         let token = restore_token.map(str::to_owned);
         let (tx, rx) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = std_mpsc::channel();
@@ -54,7 +63,7 @@ impl LinuxEmulator {
                         return;
                     }
                 };
-                rt.block_on(run(token, rx, ready_tx));
+                rt.block_on(run(token, parent, rx, ready_tx));
             })
             .map_err(|e| InputError::Ei(e.to_string()))?;
 
@@ -79,7 +88,13 @@ impl LinuxEmulator {
 
 type Ready = std_mpsc::Sender<Result<Option<String>, InputError>>;
 
-async fn run(token: Option<String>, mut rx: mpsc::Receiver<InputEvent>, ready: Ready) {
+async fn run(
+    token: Option<String>,
+    parent: Option<String>,
+    mut rx: mpsc::Receiver<InputEvent>,
+    ready: Ready,
+) {
+    let parent = crate::parent_window(parent.as_deref());
     let portal = |e: ashpd::Error| InputError::Portal(e.to_string());
     let setup = async {
         let rd = RemoteDesktop::new().await.map_err(portal)?;
@@ -97,7 +112,7 @@ async fn run(token: Option<String>, mut rx: mpsc::Receiver<InputEvent>, ready: R
         .await
         .map_err(portal)?;
         let selected = rd
-            .start(&session, None, StartOptions::default())
+            .start(&session, parent.as_ref(), StartOptions::default())
             .await
             .map_err(portal)?
             .response()

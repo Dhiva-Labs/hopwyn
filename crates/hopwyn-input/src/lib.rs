@@ -17,6 +17,19 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 pub mod linux_capture;
 
+/// Turns `wayland:<exported handle>` or `x11:<hex xid>` into the window
+/// the desktop's permission dialog should sit on top of.
+#[cfg(target_os = "linux")]
+pub(crate) fn parent_window(s: Option<&str>) -> Option<ashpd::WindowIdentifier> {
+    let s = s?;
+    if let Some(h) = s.strip_prefix("wayland:") {
+        return (!h.is_empty())
+            .then(|| ashpd::WindowIdentifier::from_xdg_foreign_exported(h.to_owned()));
+    }
+    let xid = std::os::raw::c_ulong::from_str_radix(s.strip_prefix("x11:")?, 16).ok()?;
+    Some(ashpd::WindowIdentifier::from_xid(xid))
+}
+
 use std::fmt;
 
 use hopwyn_proto::{Button, Message};

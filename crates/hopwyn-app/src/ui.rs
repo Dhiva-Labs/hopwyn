@@ -63,7 +63,8 @@ fn edge_words(edge: Edge) -> &'static str {
     }
 }
 
-/// `--background` starts Hopwyn without showing its window (used at login).
+/// `--background` (used at login) hides the window once the desktop's
+/// permissions are granted.
 pub fn run() -> glib::ExitCode {
     let background = std::env::args().any(|a| a == "--background");
     let mut builder = adw::Application::builder().application_id(APP_ID);
@@ -78,10 +79,10 @@ pub fn run() -> glib::ExitCode {
             win.present();
             return;
         }
-        let window = build(app);
-        if !(background && first.get()) {
-            window.present();
-        }
+        // Started at login: show the window while the desktop asks for
+        // permission (so its dialog has a window to sit on), then hide it.
+        let window = build(app, background && first.get());
+        window.present();
         first.set(false);
     });
     let quit = gtk::gio::SimpleAction::new("quit", None);
@@ -92,8 +93,10 @@ pub fn run() -> glib::ExitCode {
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<Control>q"]);
     // Keep running with no window open, so the link and the desktop's
-    // permissions stay alive and the dialogs are not asked again.
-    let _hold = app.hold();
+    // permissions stay alive and the dialogs are not asked again. Only the
+    // primary copy holds: startup doesn't run in a copy that just hands
+    // its launch to the running one, which then exits.
+    app.connect_startup(|app| std::mem::forget(app.hold()));
     // GTK must not see our own flags.
     let argv0: Vec<String> = std::env::args().take(1).collect();
     app.run_with_args(&argv0)
@@ -125,9 +128,11 @@ struct Ui {
     status: RefCell<(Vec<DeviceId>, Control)>,
     ready: Cell<bool>,
     failed: Cell<bool>,
+    /// Started at login: hide the window once setup is done.
+    hide_when_ready: Cell<bool>,
 }
 
-fn build(app: &adw::Application) -> adw::ApplicationWindow {
+fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindow {
     if let Some(display) = gtk::gdk::Display::default() {
         let css = gtk::CssProvider::new();
         css.load_from_data(CSS);
@@ -143,7 +148,8 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
     gtk::Window::set_default_icon_name(APP_ID);
 
     let (ui_tx, ui_rx) = async_channel::unbounded();
-    let cmd = service::spawn(ui_tx);
+    let (parent_tx, parent_rx) = std::sync::mpsc::channel();
+    let cmd = service::spawn(ui_tx, parent_rx);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -357,6 +363,7 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         status: RefCell::new((Vec::new(), Control::Local)),
         ready: Cell::new(false),
         failed: Cell::new(false),
+        hide_when_ready: Cell::new(hide_when_ready),
     });
 
     {
@@ -383,7 +390,38 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         });
     }
 
+    // Once the window is on screen, hand it to the service so the desktop's
+    // permission dialogs open on top of it instead of somewhere hidden.
+    let parent_tx = RefCell::new(Some(parent_tx));
+    window.connect_map(move |w| {
+        let Some(tx) = parent_tx.borrow_mut().take() else {
+            return;
+        };
+        export_window(w, tx);
+    });
+
     window
+}
+
+/// Sends `wayland:<handle>` or `x11:<xid>` for `window`, or `None`.
+fn export_window(window: &adw::ApplicationWindow, tx: std::sync::mpsc::Sender<Option<String>>) {
+    let Some(surface) = window.surface() else {
+        let _ = tx.send(None);
+        return;
+    };
+    if let Some(top) = surface.downcast_ref::<gdk_wayland::WaylandToplevel>() {
+        // If exporting fails the callback never runs, and the service asks
+        // without a parent after a short wait.
+        let _ = top.export_handle(move |_, handle| {
+            let _ = tx.send(handle.ok().map(|h| format!("wayland:{h}")));
+        });
+        return;
+    }
+    if let Some(x) = surface.downcast_ref::<gdk_x11::X11Surface>() {
+        let _ = tx.send(Some(format!("x11:{:x}", x.xid())));
+        return;
+    }
+    let _ = tx.send(None);
 }
 
 impl Ui {
@@ -410,6 +448,9 @@ impl Ui {
                 self.banner.set_revealed(false);
                 self.ready.set(true);
                 self.refresh_card();
+                if self.hide_when_ready.replace(false) {
+                    self.window.set_visible(false);
+                }
             }
             UiEvent::Status { connected, control } => {
                 *self.status.borrow_mut() = (connected, control);
