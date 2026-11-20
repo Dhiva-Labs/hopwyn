@@ -36,10 +36,12 @@ apps:
 
 parts:
   hopwyn:
-    plugin: rust
+    # Built by hand rather than with the rust plugin: core24's Rust is too
+    # old (1.75) and the plugin's rustup check runs before build-snaps.
+    plugin: nil
     source: .
-    rust-channel: "1.93"
-    rust-path: [crates/hopwyn-app]
+    build-snaps:
+      - rustup
     build-packages:
       - pkg-config
       - libgtk-4-dev
@@ -48,7 +50,10 @@ parts:
       craftctl default
       craftctl set version="$(git describe --tags --always 2>/dev/null || echo 0.1.0)"
     override-build: |
-      craftctl default
+      export PATH="/snap/bin:$HOME/.cargo/bin:$PATH"
+      rustup toolchain install 1.93 --profile minimal
+      cargo +1.93 build --release --locked -p hopwyn-app
+      install -Dm755 target/release/hopwyn-app "$CRAFT_PART_INSTALL/bin/hopwyn-app"
       install -Dm644 crates/hopwyn-app/data/app.hopwyn.Hopwyn.desktop \
         "$CRAFT_PART_INSTALL/share/applications/app.hopwyn.Hopwyn.desktop"
       sed -i 's|^Icon=.*|Icon=${SNAP}/share/icons/hicolor/scalable/apps/app.hopwyn.Hopwyn.svg|' \
