@@ -320,6 +320,7 @@ async fn event_loop(
                     if let Some(emu) = emulator.as_ref() {
                         let _ = emu.send(InputEvent::Motion { dx, dy });
                     }
+                    engine.handle(Input::Pushed, Instant::now());
                 }
             }
         }

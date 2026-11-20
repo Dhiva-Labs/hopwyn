@@ -49,6 +49,10 @@ pub enum Input {
     Peer(Message),
     PeerConnected,
     PeerDisconnected,
+    /// The placement push asked for by [`Action::PushToEdge`] has been sent.
+    /// Opening the injection session can take a second or more, so the
+    /// placement timeout counts from here, not from the `Enter` message.
+    Pushed,
     /// Periodic tick, for timeouts.
     Tick,
 }
@@ -157,10 +161,23 @@ impl Engine {
                     _ => Vec::new(),
                 }
             }
+            Input::Pushed => {
+                if let State::Entering { position, .. } = self.state {
+                    self.state = State::Entering {
+                        position,
+                        since: now,
+                    };
+                }
+                Vec::new()
+            }
             Input::Tick => match self.state {
-                State::Entering { since, .. } if now.duration_since(since) >= ENTER_TIMEOUT => {
+                State::Entering { position, since }
+                    if now.duration_since(since) >= ENTER_TIMEOUT =>
+                {
+                    // A late barrier hit from the push is still placement,
+                    // not the cursor heading back.
                     self.state = State::Receiving;
-                    self.placed = None;
+                    self.placed = Some(Placed { position, at: now });
                     Vec::new()
                 }
                 _ => Vec::new(),

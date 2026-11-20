@@ -172,6 +172,59 @@ fn placement_timeout_accepts_control_anyway() {
 }
 
 #[test]
+fn placement_timeout_counts_from_the_push() {
+    let mut b = engine(Edge::Left, false);
+    let t0 = Instant::now();
+    b.handle(
+        Input::Peer(Message::Enter {
+            edge: Edge::Left,
+            position: 0.5,
+        }),
+        t0,
+    );
+    // Opening the injection session took 2 seconds.
+    let pushed = t0 + Duration::from_secs(2);
+    b.handle(Input::Pushed, pushed);
+    b.handle(Input::Tick, pushed + Duration::from_millis(100));
+    assert!(matches!(b.state(), State::Entering { .. }));
+    let actions = b.handle(activated(0.9), pushed + Duration::from_millis(150));
+    assert_eq!(
+        actions,
+        vec![Action::ReleaseCapture {
+            position: Some(0.5)
+        }]
+    );
+    assert_eq!(b.state(), State::Receiving);
+}
+
+#[test]
+fn late_push_hit_after_timeout_places_instead_of_bouncing_back() {
+    let mut b = engine(Edge::Left, false);
+    let t0 = Instant::now();
+    b.handle(
+        Input::Peer(Message::Enter {
+            edge: Edge::Left,
+            position: 0.3,
+        }),
+        t0,
+    );
+    b.handle(Input::Tick, t0 + ENTER_TIMEOUT);
+    assert_eq!(b.state(), State::Receiving);
+    // The push lands just after the timeout: re-place, don't send Leave.
+    let actions = b.handle(
+        activated(0.8),
+        t0 + ENTER_TIMEOUT + Duration::from_millis(50),
+    );
+    assert_eq!(
+        actions,
+        vec![Action::ReleaseCapture {
+            position: Some(0.3)
+        }]
+    );
+    assert_eq!(b.state(), State::Receiving);
+}
+
+#[test]
 fn b_can_drive_a_the_other_way() {
     let mut p = Pair::new();
     let (a, _) = p.run(false, activated(0.2));

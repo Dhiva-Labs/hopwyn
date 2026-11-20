@@ -598,7 +598,12 @@ impl Service {
                         None => self.capture.release(),
                     };
                 }
-                Action::PushToEdge => self.push_to_edge(edge),
+                Action::PushToEdge => {
+                    self.push_to_edge(edge);
+                    if let Some(p) = self.peers.get_mut(i) {
+                        p.engine.handle(Input::Pushed, Instant::now());
+                    }
+                }
             }
         }
         if lost {
