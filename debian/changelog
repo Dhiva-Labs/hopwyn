@@ -1,4 +1,4 @@
-hopwyn (0.1.0~ppa1) resolute; urgency=medium
+hopwyn (0.1.0-0ppa1) resolute; urgency=medium
 
   * First packaged developer preview: pair by comparing a code on both
     screens, up to four computers arranged by dragging, encrypted
