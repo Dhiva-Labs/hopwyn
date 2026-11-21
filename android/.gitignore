@@ -1,0 +1,7 @@
+/local.properties
+/.gradle/
+/build/
+/app/build/
+/.kotlin/
+# Built from crates/hopwyn-mobile by scripts/build-android.sh
+/app/src/main/jniLibs/

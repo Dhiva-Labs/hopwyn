@@ -347,6 +347,8 @@ struct Peer {
     /// A phone used as trackpad and keyboard: it controls this computer but
     /// can't be controlled, so it holds no screen edge.
     remote: bool,
+    /// Debug only: pointer motion received since the last other message.
+    motion_seen: (i64, i64, u32),
 }
 
 struct Service {
@@ -530,6 +532,7 @@ impl Service {
                 screen: None,
                 return_at: None,
                 remote: false,
+                motion_seen: (0, 0, 0),
             })
             .collect();
         Ok(Self {
@@ -587,6 +590,10 @@ impl Service {
         self.send_ui(UiEvent::Settings(self.settings));
         self.send_ui(UiEvent::Input(self.input));
         self.want_input();
+        // Test mode only: open the pairing window at once (no click needed).
+        if no_input() && std::env::var_os("HOPWYN_TEST_HOST_ON_START").is_some() {
+            self.start_hosting();
+        }
         self.publish_status();
         let mut tick = tokio::time::interval(TICK);
         loop {
@@ -872,6 +879,21 @@ impl Service {
             return;
         };
         let before = peer.engine.state();
+        // Debug logs leave motion out (too many); total it instead.
+        if debug_on()
+            && let Input::Peer(Message::PointerMotion { dx, dy }) = input
+        {
+            peer.motion_seen.0 += i64::from(dx);
+            peer.motion_seen.1 += i64::from(dy);
+            peer.motion_seen.2 += 1;
+        } else if debug_on() && peer.motion_seen.2 > 0 {
+            let (x, y, n) = std::mem::take(&mut peer.motion_seen);
+            eprintln!(
+                "[hopwyn {}] {}: moved ({x}, {y}) in {n} events",
+                stamp(),
+                peer.partner.name
+            );
+        }
         let actions = peer.engine.handle(input.clone(), now);
         if debug_on()
             && !matches!(
@@ -1458,6 +1480,7 @@ impl Service {
             screen: None,
             return_at: None,
             remote: false,
+            motion_seen: (0, 0, 0),
         });
         self.partners_changed();
         self.send_ui(UiEvent::PairingDone(peer.name));

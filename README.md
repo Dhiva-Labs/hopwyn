@@ -24,6 +24,10 @@ Or from the Snap Store (developer preview on the edge channel):
 sudo snap install hopwyn --edge
 ```
 
+### Android (developer preview)
+
+Your phone becomes a trackpad and keyboard for your computers: one finger moves, a tap clicks, two fingers scroll or right-click, and the keyboard types on the computer. Pair it like a computer (tap **Pair a computer** on the phone, or click **Add computer** on the computer), then tap **Use**. Build the APK with `scripts/build-android.sh` (needs the Android SDK and NDK and `cargo install cargo-ndk`), or install a release APK. Being controlled from a computer's mouse comes next.
+
 ### From source
 
 
@@ -75,6 +79,8 @@ Then open **Hopwyn** from your app launcher on both computers:
 | `crates/hopwyn-input` | Input events, HID-to-native key mapping, injection (Linux: RemoteDesktop portal + libei) and screen-edge capture (Linux: InputCapture portal + libei), with a Ctrl+Alt+Esc panic release |
 | `crates/hopwyn-core` | Edge handoff state machine: who is active, what to send, what to inject |
 | `crates/hopwyn-app` | The desktop app (`hopwyn-app`): GTK 4 / libadwaita window, network pairing, settings, and the service tying everything together |
+| `crates/hopwyn-mobile` | The phone app's shared core (pairing, link, trackpad and keyboard input) and its JNI bridge |
+| `android/` | The Android app (Kotlin, Jetpack Compose) |
 | `crates/hopwyn-daemon` | `hopwyn`, a command-line developer tool for testing the handoff without the app |
 | `fuzz/` | Fuzz targets (`cargo +nightly fuzz run decode`) |
 
