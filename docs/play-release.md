@@ -22,16 +22,14 @@ Keep the key and its passwords somewhere safe and backed up, outside the reposit
 keytool -genkeypair -v -keystore ~/keys/hopwyn-upload.jks -alias upload -keyalg RSA -keysize 4096 -validity 10000
 ```
 
-Then create `android/keystore.properties` (git ignores it):
+Then create `android/keystore.properties` (git ignores it). It names the key, not its password:
 
 ```
 storeFile=/home/you/keys/hopwyn-upload.jks
-storePassword=…
 keyAlias=upload
-keyPassword=…
 ```
 
-Build the bundle with `scripts/build-android.sh bundle`. It warns when it falls back to the debug key.
+Build the bundle with `scripts/build-android.sh bundle`. It asks for the key's password, or reads it from `HOPWYN_KEY_PASSWORD`, and warns when it falls back to the debug key.
 
 ## 2. Play Console
 

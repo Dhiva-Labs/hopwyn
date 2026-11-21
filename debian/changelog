@@ -1,3 +1,16 @@
+hopwyn (0.2.0-0ppa1) resolute; urgency=medium
+
+  * Asks for input permissions only when needed, or once at startup, as
+    you choose; works with the other computer offline.
+  * Drag computers anywhere around the screen, with multi-monitor
+    layouts and screens of different sizes.
+  * Pairs with the Hopwyn Android app: use the phone as a trackpad and
+    keyboard, or move the pointer onto the phone to control it.
+  * Fixes: hidden permission dialogs, stalled edge capture, pairing
+    announcements that weren't noticed.
+
+ -- Dhivakar R (Dhiva-Labs) <dhivakar1010@gmail.com>  Sat, 21 Nov 2026 23:30:00 +0530
+
 hopwyn (0.1.0-0ppa1) resolute; urgency=medium
 
   * First packaged developer preview: pair by comparing a code on both

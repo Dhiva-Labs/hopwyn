@@ -21,19 +21,21 @@ android {
         }
     }
 
-    // The Play upload key, kept out of git in android/keystore.properties:
-    //   storeFile=/path/to/upload.jks  storePassword=…  keyAlias=upload  keyPassword=…
-    // Without it, release builds are signed with the debug key (fine for
-    // sideloading and testing, not for Play).
+    // The Play upload key, named in android/keystore.properties (kept out of
+    // git): storeFile=/path/to/upload.jks and keyAlias=upload. The password
+    // comes from HOPWYN_KEY_PASSWORD, which scripts/build-android.sh asks for,
+    // so it is never stored in a file. Without the properties file, release
+    // builds are signed with the debug key (fine for sideloading, not Play).
     val keyProps = rootProject.file("keystore.properties")
     signingConfigs {
         if (keyProps.exists()) {
             val p = Properties().apply { keyProps.inputStream().use { load(it) } }
             create("upload") {
                 storeFile = file(p.getProperty("storeFile"))
-                storePassword = p.getProperty("storePassword")
+                val password = System.getenv("HOPWYN_KEY_PASSWORD") ?: p.getProperty("storePassword")
+                storePassword = password
                 keyAlias = p.getProperty("keyAlias")
-                keyPassword = p.getProperty("keyPassword")
+                keyPassword = System.getenv("HOPWYN_KEY_PASSWORD") ?: p.getProperty("keyPassword") ?: password
             }
         }
     }

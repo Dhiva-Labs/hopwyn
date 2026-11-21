@@ -25,7 +25,14 @@ if [[ "$KIND" == "debug" ]]; then
   ./gradlew assembleDebug --console=plain -q
   ls app/build/outputs/apk/debug/*.apk
 elif [[ "$KIND" == "bundle" ]]; then
-  [[ -f keystore.properties ]] || echo "warning: no android/keystore.properties; signing with the debug key (Play will refuse it)" >&2
+  if [[ -f keystore.properties ]]; then
+    if [[ -z "${HOPWYN_KEY_PASSWORD:-}" ]] && ! grep -q '^storePassword=' keystore.properties; then
+      read -rsp "Upload key password: " HOPWYN_KEY_PASSWORD; echo
+      export HOPWYN_KEY_PASSWORD
+    fi
+  else
+    echo "warning: no android/keystore.properties; signing with the debug key (Play will refuse it)" >&2
+  fi
   ./gradlew bundleRelease --console=plain -q
   ls app/build/outputs/bundle/release/*.aab
 else
