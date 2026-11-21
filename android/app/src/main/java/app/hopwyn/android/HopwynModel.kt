@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -14,6 +15,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** Whether Android leaves Hopwyn running in the background. */
+fun runsInBackground(context: Context): Boolean =
+    (context.getSystemService(Context.POWER_SERVICE) as PowerManager)
+        .isIgnoringBatteryOptimizations(context.packageName)
 
 /** This phone's name as computers see it. */
 fun deviceName(context: Context): String =
@@ -54,6 +60,9 @@ class HopwynModel(app: Application) : AndroidViewModel(app) {
     /** Whether computers can drive this phone (the Accessibility service is on). */
     var controllable by mutableStateOf(ControlService.active)
         private set
+    /** Whether battery optimisation is off for Hopwyn, so it isn't stopped. */
+    var background by mutableStateOf(runsInBackground(app))
+        private set
 
     // mDNS needs multicast packets, which Android drops unless asked.
     private val multicast = (app.getSystemService(Context.WIFI_SERVICE) as WifiManager)
@@ -74,6 +83,7 @@ class HopwynModel(app: Application) : AndroidViewModel(app) {
             while (isActive) {
                 val line = withContext(Dispatchers.IO) { Native.nativeNextEvent(250) }
                 controllable = ControlService.active
+                background = runsInBackground(getApplication())
                 if (line != null) handle(line)
             }
         }

@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Lock
@@ -150,6 +151,7 @@ fun Home(model: HopwynModel) {
             }
 
             item { ControlCard(model.controllable) }
+            if (!model.background) item { BackgroundCard() }
 
             item { SectionTitle("Paired computers") }
             if (model.computers.isEmpty()) {
@@ -269,6 +271,39 @@ private fun ControlCard(on: Boolean) {
                         )
                     }) { Text("Turn on") }
                 }
+            },
+        )
+    }
+}
+
+/** Asks Android, once, to stop putting Hopwyn to sleep in the background. */
+@Composable
+private fun BackgroundCard() {
+    val context = LocalContext.current
+    Card(Modifier.fillMaxWidth()) {
+        ListItem(
+            leadingContent = { Icon(Icons.Filled.BatteryAlert, null) },
+            headlineContent = { Text("Keep Hopwyn running") },
+            supportingContent = {
+                Text(
+                    "The phone may stop Hopwyn in the background, which disconnects it and turns phone control off. Allow it to keep running.",
+                )
+            },
+            trailingContent = {
+                Button(onClick = {
+                    val ask = android.content.Intent(
+                        android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        android.net.Uri.parse("package:${context.packageName}"),
+                    ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    try {
+                        context.startActivity(ask)
+                    } catch (_: android.content.ActivityNotFoundException) {
+                        context.startActivity(
+                            android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }
+                }) { Text("Allow") }
             },
         )
     }

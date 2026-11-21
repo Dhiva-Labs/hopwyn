@@ -875,6 +875,9 @@ impl Service {
                             .is_some()
                 });
                 if i.is_none() {
+                    self.debug(&format!(
+                        "edge {edge:?} at {position}: nobody there (my screen {my:?})"
+                    ));
                     let _ = self.capture.release();
                 }
                 i
@@ -1074,7 +1077,10 @@ impl Service {
                 self.send_ui(UiEvent::Settings(self.settings));
                 self.want_input();
             }
-            Command::StartInput { parent } => self.start_input(parent),
+            Command::StartInput { parent } => {
+                self.debug(&format!("start input (parent {parent:?})"));
+                self.start_input(parent);
+            }
             Command::AskAgain => {
                 if self.input == InputState::Refused {
                     self.set_input(InputState::Waiting);
@@ -1120,6 +1126,7 @@ impl Service {
     }
 
     fn set_input(&mut self, state: InputState) {
+        self.debug(&format!("input: {:?} -> {state:?}", self.input));
         self.input = state;
         self.send_ui(UiEvent::Input(state));
     }
