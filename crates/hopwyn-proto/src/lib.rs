@@ -51,6 +51,10 @@ pub enum Message {
     Enter { edge: Edge, position: f32 },
     /// The cursor left the receiver. The receiver becomes inactive.
     Leave,
+    /// Like `Leave`, saying where the cursor came back: `position` along
+    /// the receiver's own shared edge (0.0 to 1.0), so it reappears at the
+    /// matching spot.
+    LeaveAt { position: f32 },
     /// Relative pointer motion in device pixels.
     PointerMotion { dx: i32, dy: i32 },
     /// A mouse button changed state.
@@ -62,6 +66,12 @@ pub enum Message {
     Key { code: u16, pressed: bool },
     /// New clipboard text from the sender.
     ClipboardText { text: String },
+    /// The sender's whole desktop size in logical pixels, for drawing the
+    /// layout to scale and mapping positions between unequal screens.
+    Screen { width: u32, height: u32 },
+    /// Like `Layout`, with the receiver's screen shifted `offset` logical
+    /// pixels along the sender's edge (from its top or left).
+    Placement { edge: Edge, offset: i32 },
     /// Layout: the receiver's screen sits beyond the sender's `edge`, so the
     /// receiver places the sender beyond the opposite edge. Keeps both
     /// computers' arrangement in step when it changes on either.

@@ -6,6 +6,8 @@
 //!   screen it sits beyond, its name. (Older builds wrote one to `partner`.)
 //! - `restore-token`: the desktop's remote-control permission token (0600),
 //!   so the remote-control dialog is shown once, not on every handoff.
+//! - `settings`: `key=value` lines: `sharing` (on/off) and `ask`
+//!   (`online` or `startup`: when to ask for the input-capture permission).
 
 use std::fs;
 use std::io::Write;
@@ -15,8 +17,38 @@ use std::path::{Path, PathBuf};
 use hopwyn_pair::{DeviceId, Identity, MAX_NAME_LEN};
 use hopwyn_proto::Edge;
 
-/// Most devices one computer can be paired with: one beyond each screen edge.
-pub const MAX_PARTNERS: usize = 4;
+/// Most computers one can be paired with. Only one per screen edge can be
+/// online at a time; computers that are never on together (a home and an
+/// office desktop) can share a side.
+pub const MAX_PARTNERS: usize = 16;
+
+/// When to ask the desktop for the input-capture permission. GNOME 50 and
+/// older forget it at logout, so this decides when the dialog appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskWhen {
+    /// Only once a paired computer is online (no dialog at login otherwise).
+    Online,
+    /// As soon as Hopwyn starts.
+    Startup,
+}
+
+/// User preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    /// Share this mouse and keyboard at all. Off: no permissions are asked,
+    /// and other computers can't take control of this one.
+    pub sharing: bool,
+    pub ask: AskWhen,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            sharing: true,
+            ask: AskWhen::Online,
+        }
+    }
+}
 
 /// A device this one shares its mouse and keyboard with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +57,9 @@ pub struct Partner {
     pub name: String,
     /// The edge of THIS screen beyond which the partner's screen sits.
     pub edge: Edge,
+    /// How far along that edge the partner's screen starts, in this
+    /// screen's logical pixels (see `layout`).
+    pub offset: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -68,18 +103,49 @@ impl Store {
         }
     }
 
-    /// The paired devices, at most one per edge. Bad lines are skipped.
+    /// The paired devices (several may share a side). Bad lines are skipped.
     pub fn partners(&self) -> Vec<Partner> {
         let text = fs::read_to_string(self.dir.join("partners"))
             .or_else(|_| fs::read_to_string(self.dir.join("partner")))
             .unwrap_or_default();
         let mut out: Vec<Partner> = Vec::new();
         for p in text.lines().filter_map(parse_partner) {
-            if out.len() < MAX_PARTNERS && !out.iter().any(|q| q.id == p.id || q.edge == p.edge) {
+            if out.len() < MAX_PARTNERS && !out.iter().any(|q| q.id == p.id) {
                 out.push(p);
             }
         }
         out
+    }
+
+    pub fn settings(&self) -> Settings {
+        let mut s = Settings::default();
+        let text = fs::read_to_string(self.dir.join("settings")).unwrap_or_default();
+        for line in text.lines() {
+            match line.trim().split_once('=') {
+                Some(("sharing", v)) => s.sharing = v.trim() != "off",
+                Some(("ask", v)) => {
+                    s.ask = if v.trim() == "startup" {
+                        AskWhen::Startup
+                    } else {
+                        AskWhen::Online
+                    };
+                }
+                _ => {}
+            }
+        }
+        s
+    }
+
+    pub fn save_settings(&self, s: Settings) -> Result<(), String> {
+        let text = format!(
+            "sharing={}\nask={}\n",
+            if s.sharing { "on" } else { "off" },
+            match s.ask {
+                AskWhen::Online => "online",
+                AskWhen::Startup => "startup",
+            }
+        );
+        write_private(&self.dir.join("settings"), text.as_bytes())
     }
 
     pub fn save_partners(&self, partners: &[Partner]) -> Result<(), String> {
@@ -186,12 +252,16 @@ pub fn parse_hex_id(s: &str) -> Option<DeviceId> {
     Some(DeviceId::from_bytes(out))
 }
 
-/// One line: `<key hex> <edge> <name>`. The name may contain spaces.
+/// One line: `<key hex> <edge>[@offset] <name>`. The name may contain spaces.
 fn format_partner(p: &Partner) -> String {
+    let side = if p.offset == 0 {
+        edge_name(p.edge).to_owned()
+    } else {
+        format!("{}@{}", edge_name(p.edge), p.offset)
+    };
     format!(
-        "{} {} {}\n",
+        "{} {side} {}\n",
         hex_id(&p.id),
-        edge_name(p.edge),
         p.name.replace(['\n', '\r'], " ")
     )
 }
@@ -199,14 +269,26 @@ fn format_partner(p: &Partner) -> String {
 fn parse_partner(line: &str) -> Option<Partner> {
     let mut parts = line.splitn(3, ' ');
     let id = parse_hex_id(parts.next()?)?;
-    let edge = parse_edge(parts.next()?)?;
+    let side = parts.next()?;
+    let (edge, offset) = match side.split_once('@') {
+        Some((e, o)) => (
+            parse_edge(e)?,
+            o.parse::<i32>().ok()?.clamp(-65_536, 65_536),
+        ),
+        None => (parse_edge(side)?, 0),
+    };
     let name: String = parts
         .next()
         .unwrap_or("")
         .chars()
         .take(MAX_NAME_LEN)
         .collect();
-    Some(Partner { id, name, edge })
+    Some(Partner {
+        id,
+        name,
+        edge,
+        offset,
+    })
 }
 
 /// This machine's name, shown to other devices.
@@ -268,7 +350,21 @@ mod tests {
             id: Identity::generate("x").id(),
             name: name.into(),
             edge,
+            offset: 0,
         }
+    }
+
+    #[test]
+    fn offsets_round_trip_and_old_lines_mean_zero() {
+        let s = temp_store();
+        let mut p = partner("Laptop beside tall monitor", Edge::Right);
+        p.offset = -360;
+        s.save_partners(std::slice::from_ref(&p)).unwrap();
+        assert_eq!(s.partners(), vec![p.clone()]);
+        let old = format!("{} left Desk\n", hex_id(&p.id));
+        write_private(&s.dir.join("partners"), old.as_bytes()).unwrap();
+        assert_eq!(s.partners().first().unwrap().offset, 0);
+        assert_eq!(s.partners().first().unwrap().edge, Edge::Left);
     }
 
     #[test]
@@ -297,16 +393,29 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_edges_and_bad_lines_are_skipped() {
+    fn shared_sides_are_kept_and_bad_lines_and_duplicates_skipped() {
         let s = temp_store();
-        let (a, b) = (partner("A", Edge::Left), partner("B", Edge::Left));
+        let (a, b) = (partner("Home", Edge::Left), partner("Office", Edge::Left));
         let text = format!(
-            "{}nonsense here\n{}",
+            "{}nonsense here\n{}{}",
             format_partner(&a),
-            format_partner(&b)
+            format_partner(&b),
+            format_partner(&a)
         );
         write_private(&s.dir.join("partners"), text.as_bytes()).unwrap();
-        assert_eq!(s.partners(), vec![a]);
+        assert_eq!(s.partners(), vec![a, b]);
+    }
+
+    #[test]
+    fn settings_default_and_round_trip() {
+        let s = temp_store();
+        assert_eq!(s.settings(), Settings::default());
+        let off = Settings {
+            sharing: false,
+            ask: AskWhen::Startup,
+        };
+        s.save_settings(off).unwrap();
+        assert_eq!(s.settings(), off);
     }
 
     #[test]

@@ -5,6 +5,8 @@ mod pairing_net;
 #[cfg(target_os = "linux")]
 mod config;
 #[cfg(target_os = "linux")]
+mod layout;
+#[cfg(target_os = "linux")]
 mod service;
 #[cfg(target_os = "linux")]
 mod ui;

@@ -12,6 +12,9 @@ mod tag {
     pub const KEY: u8 = 0x20;
     pub const CLIPBOARD_TEXT: u8 = 0x30;
     pub const LAYOUT: u8 = 0x40;
+    pub const SCREEN: u8 = 0x41;
+    pub const PLACEMENT: u8 = 0x42;
+    pub const LEAVE_AT: u8 = 0x04;
     pub const HEARTBEAT: u8 = 0x70;
     pub const DISCONNECT: u8 = 0x7f;
 }
@@ -94,6 +97,20 @@ pub(crate) fn encode(msg: &Message, out: &mut Vec<u8>) {
             out.push(tag::CLIPBOARD_TEXT);
             put_str(out, text);
         }
+        Message::LeaveAt { position } => {
+            out.push(tag::LEAVE_AT);
+            out.extend_from_slice(&position.to_le_bytes());
+        }
+        Message::Screen { width, height } => {
+            out.push(tag::SCREEN);
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&height.to_le_bytes());
+        }
+        Message::Placement { edge, offset } => {
+            out.push(tag::PLACEMENT);
+            out.push(edge_to_u8(*edge));
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
         Message::Layout { edge } => {
             out.push(tag::LAYOUT);
             out.push(edge_to_u8(*edge));
@@ -141,6 +158,29 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
         tag::CLIPBOARD_TEXT => Message::ClipboardText {
             text: r.string("clipboard text", MAX_CLIPBOARD_TEXT)?,
         },
+        tag::LEAVE_AT => {
+            let position = r.f32("position")?;
+            if !(0.0..=1.0).contains(&position) {
+                return Err(DecodeError::InvalidValue("position"));
+            }
+            Message::LeaveAt { position }
+        }
+        tag::SCREEN => {
+            let (width, height) = (r.u32()?, r.u32()?);
+            // Bounded so layout arithmetic can't overflow.
+            if width == 0 || height == 0 || width > 65_536 || height > 65_536 {
+                return Err(DecodeError::InvalidValue("screen size"));
+            }
+            Message::Screen { width, height }
+        }
+        tag::PLACEMENT => {
+            let edge = edge_from_u8(r.u8()?)?;
+            let offset = r.i32()?;
+            if offset.unsigned_abs() > 65_536 {
+                return Err(DecodeError::InvalidValue("offset"));
+            }
+            Message::Placement { edge, offset }
+        }
         tag::LAYOUT => Message::Layout {
             edge: edge_from_u8(r.u8()?)?,
         },
@@ -314,6 +354,15 @@ mod tests {
             },
             Message::Heartbeat { seq: 42 },
             Message::Layout { edge: Edge::Top },
+            Message::LeaveAt { position: 0.25 },
+            Message::Screen {
+                width: 2560,
+                height: 1440,
+            },
+            Message::Placement {
+                edge: Edge::Left,
+                offset: -300,
+            },
             Message::Disconnect,
         ]
     }

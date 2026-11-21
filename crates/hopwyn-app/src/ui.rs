@@ -1,6 +1,7 @@
 //! The Hopwyn window (GTK 4 + libadwaita).
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -8,9 +9,10 @@ use gtk::glib;
 use hopwyn_proto::Edge;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::MAX_PARTNERS;
 use crate::config::Partner;
-use crate::service::{self, Command, Control, Nearby, UiEvent};
+use crate::config::{AskWhen, MAX_PARTNERS};
+use crate::layout::{self, Size};
+use crate::service::{self, Command, Control, InputState, Nearby, UiEvent};
 use hopwyn_pair::DeviceId;
 
 pub const APP_ID: &str = "app.hopwyn.Hopwyn";
@@ -27,13 +29,6 @@ const CSS: &str = "
 .status-card image { color: @accent_color; }
 .status-card.inactive image { color: @warning_color; }
 .status-card.problem image { color: @error_color; }
-.layout-tile { padding: 10px 12px; border-radius: 10px; min-width: 96px; min-height: 52px; }
-.layout-tile.this { background: alpha(@accent_bg_color, 0.85); color: @accent_fg_color; font-weight: 700; }
-.layout-tile.peer { background: alpha(@card_fg_color, 0.08); }
-.layout-tile.peer.online { background: alpha(@success_color, 0.18); }
-.layout-tile.peer.active { background: alpha(@warning_color, 0.30); }
-.layout-tile.peer.picked { outline: 3px solid @accent_color; outline-offset: 2px; }
-.layout-tile.peer.slot { background: none; border: 2px dashed alpha(@card_fg_color, 0.25); color: alpha(@card_fg_color, 0.5); }
 .pairing-code { font-size: 44px; font-weight: 800; letter-spacing: 6px; font-feature-settings: 'tnum'; }
 ";
 
@@ -65,8 +60,7 @@ fn edge_words(edge: Edge) -> &'static str {
     }
 }
 
-/// `--background` (used at login) hides the window once the desktop's
-/// permissions are granted.
+/// `--background` (used at login) starts with the window hidden.
 pub fn run() -> glib::ExitCode {
     let background = std::env::args().any(|a| a == "--background");
     let mut builder = adw::Application::builder().application_id(APP_ID);
@@ -81,10 +75,12 @@ pub fn run() -> glib::ExitCode {
             win.present();
             return;
         }
-        // Started at login: show the window while the desktop asks for
-        // permission (so its dialog has a window to sit on), then hide it.
-        let window = build(app, background && first.get());
-        window.present();
+        // Started at login: stay hidden. If a permission dialog is needed
+        // later, the window comes up for it and hides again afterwards.
+        let window = build(app);
+        if !(background && first.get()) {
+            window.present();
+        }
         first.set(false);
     });
     let quit = gtk::gio::SimpleAction::new("quit", None);
@@ -114,9 +110,17 @@ struct Ui {
     status_title: gtk::Label,
     status_text: gtk::Label,
     partner_group: adw::PreferencesGroup,
-    layout: gtk::Grid,
-    /// Left, right, top, bottom.
-    layout_tiles: [gtk::Label; 4],
+    /// The layout editor: this desktop's monitors and the online computers
+    /// around it, to scale; drag a computer to move it.
+    canvas: gtk::DrawingArea,
+    /// This desktop's size and its monitors (x, y, width, height relative to
+    /// the desktop's top-left), in logical pixels.
+    my_size: Cell<Option<Size>>,
+    monitors: RefCell<Vec<(f64, f64, f64, f64)>>,
+    peer_sizes: RefCell<HashMap<DeviceId, Size>>,
+    drag: RefCell<Option<Drag>>,
+    /// Canvas transform from the last draw: (scale, x origin, y origin).
+    view: Cell<(f64, f64, f64)>,
     partner_rows: RefCell<Vec<(DeviceId, adw::ActionRow)>>,
     empty_row: adw::ActionRow,
     nearby_group: adw::PreferencesGroup,
@@ -130,13 +134,19 @@ struct Ui {
     status: RefCell<(Vec<DeviceId>, Control)>,
     ready: Cell<bool>,
     failed: Cell<bool>,
-    /// Started at login: hide the window once setup is done.
-    hide_when_ready: Cell<bool>,
-    /// A computer picked in the layout picture, waiting for a side.
-    picked: Cell<Option<DeviceId>>,
+    /// The window was hidden when a permission dialog needed it: hide it
+    /// again once permission is granted.
+    hide_after_input: Cell<bool>,
+    /// The window should hand itself to the service once it's on screen.
+    export_pending: Cell<bool>,
+    sharing_row: adw::SwitchRow,
+    ask_row: adw::ComboRow,
+    /// Set while the rows are updated from the service, so that doesn't
+    /// echo back as a command.
+    updating: Cell<bool>,
 }
 
-fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindow {
+fn build(app: &adw::Application) -> adw::ApplicationWindow {
     if let Some(display) = gtk::gdk::Display::default() {
         let css = gtk::CssProvider::new();
         css.load_from_data(CSS);
@@ -152,8 +162,7 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
     gtk::Window::set_default_icon_name(APP_ID);
 
     let (ui_tx, ui_rx) = async_channel::unbounded();
-    let (parent_tx, parent_rx) = std::sync::mpsc::channel();
-    let cmd = service::spawn(ui_tx, parent_rx);
+    let cmd = service::spawn(ui_tx);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -204,53 +213,34 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
     card.append(&status_title);
     card.append(&status_text);
 
+    // Sharing on/off, and when to ask for the desktop's permission.
+    let sharing_group = adw::PreferencesGroup::builder().title("Sharing").build();
+    let sharing_row = adw::SwitchRow::builder()
+        .title("Share mouse and keyboard")
+        .active(true)
+        .build();
+    let ask_row = adw::ComboRow::builder()
+        .title("Ask for permission")
+        .subtitle("When needed: only once a paired computer is online. GNOME forgets the answer at logout.")
+        .model(&gtk::StringList::new(&["When needed", "At startup"]))
+        .build();
+    sharing_group.add(&sharing_row);
+    sharing_group.add(&ask_row);
+
     // Paired computers, with a picture of where each one sits.
     let partner_group = adw::PreferencesGroup::builder()
         .title("Paired computers")
         .description(format!(
-            "Up to {MAX_PARTNERS}, one on each side of this screen. Drag a computer (or click it, then click a side) to where its screen is; the other computer updates too."
+            "Up to {MAX_PARTNERS}. Drag a computer in the picture to where its screen really is, along any edge; the other computer updates too. Computers that are never on together (home and office) can share a side."
         ))
         .build();
-    let layout = gtk::Grid::builder()
-        .row_spacing(8)
-        .column_spacing(8)
-        .halign(gtk::Align::Center)
+    let canvas = gtk::DrawingArea::builder()
+        .content_height(240)
+        .hexpand(true)
         .margin_bottom(12)
+        .visible(false)
         .build();
-    let tile = |text: &str, classes: &[&str]| {
-        let l = gtk::Label::builder()
-            .label(text)
-            .wrap(true)
-            .justify(gtk::Justification::Center)
-            .max_width_chars(12)
-            .build();
-        l.add_css_class("layout-tile");
-        for c in classes {
-            l.add_css_class(c);
-        }
-        l
-    };
-    layout.attach(&tile("This computer", &["this"]), 1, 1, 1, 1);
-    let layout_tiles: [gtk::Label; 4] = [
-        tile("", &["peer"]),
-        tile("", &["peer"]),
-        tile("", &["peer"]),
-        tile("", &["peer"]),
-    ];
-    for (edge, t) in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
-        .into_iter()
-        .zip(layout_tiles.iter())
-    {
-        let (col, row) = match edge {
-            Edge::Left => (0, 1),
-            Edge::Right => (2, 1),
-            Edge::Top => (1, 0),
-            Edge::Bottom => (1, 2),
-        };
-        layout.attach(t, col, row, 1, 1);
-    }
-    layout.set_visible(false);
-    partner_group.add(&layout);
+    partner_group.add(&canvas);
     let empty_row = adw::ActionRow::builder()
         .title("No computer paired yet")
         .subtitle("Click Add computer here, or Pair on a computer listed under Nearby")
@@ -326,6 +316,7 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
         .margin_end(16)
         .build();
     content.append(&card);
+    content.append(&sharing_group);
     content.append(&partner_group);
     content.append(&add_group);
     content.append(&nearby_group);
@@ -353,8 +344,12 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
         status_title,
         status_text,
         partner_group,
-        layout,
-        layout_tiles,
+        canvas: canvas.clone(),
+        my_size: Cell::new(None),
+        monitors: RefCell::new(Vec::new()),
+        peer_sizes: RefCell::new(HashMap::new()),
+        drag: RefCell::new(None),
+        view: Cell::new((1.0, 0.0, 0.0)),
         partner_rows: RefCell::new(Vec::new()),
         empty_row,
         nearby_group,
@@ -367,8 +362,11 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
         status: RefCell::new((Vec::new(), Control::Local)),
         ready: Cell::new(false),
         failed: Cell::new(false),
-        hide_when_ready: Cell::new(hide_when_ready),
-        picked: Cell::new(None),
+        hide_after_input: Cell::new(false),
+        export_pending: Cell::new(false),
+        sharing_row: sharing_row.clone(),
+        ask_row: ask_row.clone(),
+        updating: Cell::new(false),
     });
 
     {
@@ -395,82 +393,97 @@ fn build(app: &adw::Application, hide_when_ready: bool) -> adw::ApplicationWindo
         });
     }
 
-    // Drag a computer's tile to another side to move it there.
-    for (edge, tile) in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
-        .into_iter()
-        .zip(ui.layout_tiles.iter())
+    // The layout editor: draw it, and drag computers around.
     {
-        let source = gtk::DragSource::new();
-        source.set_actions(gtk::gdk::DragAction::MOVE);
-        {
-            let ui2 = ui.clone();
-            source.connect_prepare(move |_, _, _| {
-                let partners = ui2.partners.borrow();
-                let p = partners.iter().find(|p| p.edge == edge)?;
-                Some(gtk::gdk::ContentProvider::for_value(
-                    &crate::config::hex_id(&p.id).to_value(),
-                ))
-            });
-        }
-        tile.add_controller(source);
-        let target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
-        {
-            let ui2 = ui.clone();
-            target.connect_drop(move |_, value, _, _| {
-                let Some(id) = value
-                    .get::<String>()
-                    .ok()
-                    .and_then(|h| crate::config::parse_hex_id(&h))
-                else {
-                    return false;
-                };
-                let _ = ui2.cmd.send(Command::SetEdge { id, edge });
-                true
-            });
-        }
-        tile.add_controller(target);
-
-        // Or click a computer, then click the side to put it on.
-        let click = gtk::GestureClick::new();
-        {
-            let ui2 = ui.clone();
-            click.connect_released(move |_, _, _, _| ui2.layout_clicked(edge));
-        }
-        tile.add_controller(click);
+        let ui2 = ui.clone();
+        canvas.set_draw_func(move |_, cr, w, h| ui2.draw_layout(cr, f64::from(w), f64::from(h)));
+    }
+    {
+        let drag = gtk::GestureDrag::new();
+        let ui2 = ui.clone();
+        drag.connect_drag_begin(move |_, x, y| ui2.drag_begin(x, y));
+        let ui2 = ui.clone();
+        drag.connect_drag_update(move |_, dx, dy| ui2.drag_update(dx, dy));
+        let ui2 = ui.clone();
+        drag.connect_drag_end(move |_, dx, dy| ui2.drag_end(dx, dy));
+        canvas.add_controller(drag);
+    }
+    // This desktop's monitors, now and whenever they change.
+    if let Some(display) = gtk::gdk::Display::default() {
+        ui.read_monitors(&display);
+        let ui2 = ui.clone();
+        let d2 = display.clone();
+        display
+            .monitors()
+            .connect_items_changed(move |_, _, _, _| ui2.read_monitors(&d2));
     }
 
-    // Once the window is on screen, hand it to the service so the desktop's
-    // permission dialogs open on top of it instead of somewhere hidden.
-    let parent_tx = RefCell::new(Some(parent_tx));
-    window.connect_map(move |w| {
-        let Some(tx) = parent_tx.borrow_mut().take() else {
-            return;
-        };
-        export_window(w, tx);
-    });
+    {
+        let ui2 = ui.clone();
+        ui.sharing_row.connect_active_notify(move |row| {
+            if !ui2.updating.get() {
+                let _ = ui2.cmd.send(Command::SetSharing(row.is_active()));
+            }
+        });
+    }
+    {
+        let ui2 = ui.clone();
+        ui.ask_row.connect_selected_notify(move |row| {
+            if !ui2.updating.get() {
+                let ask = if row.selected() == 1 {
+                    AskWhen::Startup
+                } else {
+                    AskWhen::Online
+                };
+                let _ = ui2.cmd.send(Command::SetAskWhen(ask));
+            }
+        });
+    }
+    {
+        let ui2 = ui.clone();
+        ui.banner.connect_button_clicked(move |_| {
+            let _ = ui2.cmd.send(Command::AskAgain);
+        });
+    }
+    // When a permission dialog is wanted and the window had to be shown
+    // first, hand it to the service once it's on screen.
+    {
+        let ui2 = ui.clone();
+        window.connect_map(move |w| {
+            if ui2.export_pending.replace(false) {
+                export_window(w, ui2.cmd.clone());
+            }
+        });
+    }
 
     window
 }
 
-/// Sends `wayland:<handle>` or `x11:<xid>` for `window`, or `None`.
-fn export_window(window: &adw::ApplicationWindow, tx: std::sync::mpsc::Sender<Option<String>>) {
+/// Tells the service to ask for permission, with `window` (as
+/// `wayland:<handle>` or `x11:<xid>`) for the dialog to open on.
+fn export_window(window: &adw::ApplicationWindow, cmd: UnboundedSender<Command>) {
+    let start = move |parent: Option<String>| {
+        let _ = cmd.send(Command::StartInput { parent });
+    };
     let Some(surface) = window.surface() else {
-        let _ = tx.send(None);
+        start(None);
         return;
     };
     if let Some(top) = surface.downcast_ref::<gdk_wayland::WaylandToplevel>() {
-        // If exporting fails the callback never runs, and the service asks
-        // without a parent after a short wait.
-        let _ = top.export_handle(move |_, handle| {
-            let _ = tx.send(handle.ok().map(|h| format!("wayland:{h}")));
+        let start2 = start.clone();
+        let exported = top.export_handle(move |_, handle| {
+            start2(handle.ok().map(|h| format!("wayland:{h}")));
         });
+        if !exported {
+            start(None);
+        }
         return;
     }
     if let Some(x) = surface.downcast_ref::<gdk_x11::X11Surface>() {
-        let _ = tx.send(Some(format!("x11:{:x}", x.xid())));
+        start(Some(format!("x11:{:x}", x.xid())));
         return;
     }
-    let _ = tx.send(None);
+    start(None);
 }
 
 impl Ui {
@@ -497,10 +510,35 @@ impl Ui {
                 self.banner.set_revealed(false);
                 self.ready.set(true);
                 self.refresh_card();
-                if self.hide_when_ready.replace(false) {
-                    self.window.set_visible(false);
+            }
+            UiEvent::Settings(settings) => {
+                self.updating.set(true);
+                self.sharing_row.set_active(settings.sharing);
+                self.ask_row.set_selected(match settings.ask {
+                    AskWhen::Online => 0,
+                    AskWhen::Startup => 1,
+                });
+                self.updating.set(false);
+            }
+            UiEvent::Input(state) => self.show_input(state),
+            UiEvent::AskPermission => {
+                if !self.window.is_visible() {
+                    self.hide_after_input.set(true);
+                }
+                if self.window.is_mapped() {
+                    self.window.present();
+                    export_window(&self.window, self.cmd.clone());
+                } else {
+                    self.export_pending.set(true);
+                    self.window.present();
                 }
             }
+            UiEvent::Notice(text) => self.toast(&text),
+            UiEvent::PeerScreen { id, size } => {
+                self.peer_sizes.borrow_mut().insert(id, size);
+                self.canvas.queue_draw();
+            }
+
             UiEvent::Status { connected, control } => {
                 *self.status.borrow_mut() = (connected, control);
                 self.refresh_card();
@@ -537,6 +575,45 @@ impl Ui {
                     "problem",
                 );
             }
+        }
+    }
+
+    /// Shows where the input permission stands.
+    fn show_input(&self, state: InputState) {
+        let (subtitle, banner) = match state {
+            InputState::Off => (
+                "Off: other computers can't use or be used from this one",
+                None,
+            ),
+            InputState::Waiting => ("Will ask for permission when it's needed", None),
+            InputState::Asking => (
+                "Asking for permission",
+                Some(
+                    "Allow Hopwyn in the desktop's dialog. If you don't see it, press the Super key.",
+                ),
+            ),
+            InputState::Ready => ("On: the screen edges are live", None),
+            InputState::Refused => (
+                "Permission not given",
+                Some("Hopwyn needs permission to use the screen edges."),
+            ),
+            InputState::Disabled => ("Test mode: no input", None),
+        };
+        self.sharing_row.set_subtitle(subtitle);
+        match banner {
+            Some(text) => {
+                self.banner.set_title(text);
+                self.banner
+                    .set_button_label((state == InputState::Refused).then_some("Allow…"));
+                self.banner.set_revealed(true);
+            }
+            None => self.banner.set_revealed(false),
+        }
+        if state == InputState::Ready && self.hide_after_input.replace(false) {
+            self.window.set_visible(false);
+        }
+        if state != InputState::Asking {
+            self.refresh_card();
         }
     }
 
@@ -630,28 +707,6 @@ impl Ui {
         }
     }
 
-    /// A click on the layout picture's tile for `edge`: pick the computer
-    /// there, or move the picked one to this side.
-    fn layout_clicked(&self, edge: Edge) {
-        let here = self
-            .partners
-            .borrow()
-            .iter()
-            .find(|p| p.edge == edge)
-            .map(|p| p.id);
-        match (self.picked.take(), here) {
-            (Some(id), _) if Some(id) != here => {
-                let _ = self.cmd.send(Command::SetEdge { id, edge });
-            }
-            (None, Some(id)) => {
-                self.picked.set(Some(id));
-                self.toast("Now click the side its screen is on");
-            }
-            _ => {}
-        }
-        self.refresh_partner_status();
-    }
-
     /// Updates each paired computer's subtitle and the layout picture.
     fn refresh_partner_status(&self) {
         let (connected, control) = self.status.borrow().clone();
@@ -668,33 +723,8 @@ impl Ui {
             };
             row.set_subtitle(state);
         }
-        for (edge, tile) in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
-            .into_iter()
-            .zip(self.layout_tiles.iter())
-        {
-            let p = partners.iter().find(|p| p.edge == edge);
-            // Empty sides stay visible as drop targets for dragging.
-            for c in ["online", "active", "slot", "picked"] {
-                tile.remove_css_class(c);
-            }
-            if p.is_none() {
-                tile.set_label("Drop here");
-                tile.add_css_class("slot");
-            }
-            if let Some(p) = p {
-                tile.set_label(&p.name);
-                let active = matches!(control, Control::Controlling(c) | Control::ControlledBy(c) if c == p.id);
-                if self.picked.get() == Some(p.id) {
-                    tile.add_css_class("picked");
-                }
-                if active {
-                    tile.add_css_class("active");
-                } else if connected.contains(&p.id) {
-                    tile.add_css_class("online");
-                }
-            }
-        }
-        self.layout.set_visible(!partners.is_empty());
+        self.canvas.set_visible(!partners.is_empty());
+        self.canvas.queue_draw();
     }
 
     /// Rebuilds one row per paired computer.
@@ -942,5 +972,270 @@ fn join_words(items: &[&str]) -> String {
         [] => String::new(),
         [one] => (*one).to_owned(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// A computer being dragged in the layout editor (world coordinates are
+/// this desktop's logical pixels, its top-left at 0,0).
+#[derive(Debug, Clone, Copy)]
+struct Drag {
+    id: DeviceId,
+    /// Its rectangle when the drag began.
+    x0: f64,
+    y0: f64,
+    /// Where it is now.
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+const DEFAULT_SIZE: Size = Size {
+    width: 1920,
+    height: 1080,
+};
+
+impl Ui {
+    /// Reads this desktop's monitors and tells the service its size.
+    fn read_monitors(&self, display: &gtk::gdk::Display) {
+        let list = display.monitors();
+        let mut rects = Vec::new();
+        for i in 0..list.n_items() {
+            if let Some(m) = list
+                .item(i)
+                .and_then(|o| o.downcast::<gtk::gdk::Monitor>().ok())
+            {
+                let g = m.geometry();
+                rects.push((
+                    f64::from(g.x()),
+                    f64::from(g.y()),
+                    f64::from(g.width()),
+                    f64::from(g.height()),
+                ));
+            }
+        }
+        if rects.is_empty() {
+            return;
+        }
+        let min_x = rects.iter().map(|r| r.0).fold(f64::MAX, f64::min);
+        let min_y = rects.iter().map(|r| r.1).fold(f64::MAX, f64::min);
+        let max_x = rects.iter().map(|r| r.0 + r.2).fold(f64::MIN, f64::max);
+        let max_y = rects.iter().map(|r| r.1 + r.3).fold(f64::MIN, f64::max);
+        for r in &mut rects {
+            r.0 -= min_x;
+            r.1 -= min_y;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let size = Size {
+            width: (max_x - min_x).max(1.0) as u32,
+            height: (max_y - min_y).max(1.0) as u32,
+        };
+        *self.monitors.borrow_mut() = rects;
+        self.my_size.set(Some(size));
+        let _ = self.cmd.send(Command::SetScreen(size));
+        self.canvas.queue_draw();
+    }
+
+    /// The online computers' rectangles, in world coordinates.
+    fn peer_rects(&self) -> Vec<(Partner, (f64, f64, f64, f64))> {
+        let mine = self.my_size.get().unwrap_or(DEFAULT_SIZE);
+        let (mw, mh) = (f64::from(mine.width), f64::from(mine.height));
+        let connected = self.status.borrow().0.clone();
+        let sizes = self.peer_sizes.borrow();
+        let drag = *self.drag.borrow();
+        self.partners
+            .borrow()
+            .iter()
+            .filter(|p| connected.contains(&p.id))
+            .map(|p| {
+                let size = sizes.get(&p.id).copied().unwrap_or(mine);
+                let (w, h) = (f64::from(size.width), f64::from(size.height));
+                let o = f64::from(p.offset);
+                let rect = match drag {
+                    Some(d) if d.id == p.id => (d.x, d.y, d.w, d.h),
+                    _ => match p.edge {
+                        Edge::Right => (mw, o, w, h),
+                        Edge::Left => (-w, o, w, h),
+                        Edge::Top => (o, -h, w, h),
+                        Edge::Bottom => (o, mh, w, h),
+                    },
+                };
+                (p.clone(), rect)
+            })
+            .collect()
+    }
+
+    fn draw_layout(&self, cr: &gtk::cairo::Context, width: f64, height: f64) {
+        let mine = self.my_size.get().unwrap_or(DEFAULT_SIZE);
+        let (mw, mh) = (f64::from(mine.width), f64::from(mine.height));
+        let peers = self.peer_rects();
+        // Fit everything, with a margin.
+        let (mut x0, mut y0, mut x1, mut y1) = (0.0_f64, 0.0_f64, mw, mh);
+        for (_, (x, y, w, h)) in &peers {
+            x0 = x0.min(*x);
+            y0 = y0.min(*y);
+            x1 = x1.max(x + w);
+            y1 = y1.max(y + h);
+        }
+        let margin = 12.0;
+        let scale = ((width - 2.0 * margin) / (x1 - x0))
+            .min((height - 2.0 * margin) / (y1 - y0))
+            .max(0.0001);
+        let ox = (width - (x1 - x0) * scale) / 2.0 - x0 * scale;
+        let oy = (height - (y1 - y0) * scale) / 2.0 - y0 * scale;
+        self.view.set((scale, ox, oy));
+        let to_screen =
+            |x: f64, y: f64, w: f64, h: f64| (ox + x * scale, oy + y * scale, w * scale, h * scale);
+
+        // This desktop: each monitor.
+        let monitors = self.monitors.borrow().clone();
+        let monitors = if monitors.is_empty() {
+            vec![(0.0, 0.0, mw, mh)]
+        } else {
+            monitors
+        };
+        for (x, y, w, h) in &monitors {
+            let (sx, sy, sw, sh) = to_screen(*x, *y, *w, *h);
+            rounded(cr, sx + 1.5, sy + 1.5, sw - 3.0, sh - 3.0, 8.0);
+            cr.set_source_rgb(0.21, 0.52, 0.89);
+            let _ = cr.fill();
+        }
+        let (sx, sy, sw, sh) = to_screen(0.0, 0.0, mw, mh);
+        let label = if monitors.len() > 1 {
+            format!("This computer · {} screens", monitors.len())
+        } else {
+            "This computer".to_owned()
+        };
+        centered_text(cr, &label, sx + sw / 2.0, sy + sh / 2.0, sw - 12.0, true);
+
+        // The online computers around it.
+        let control = self.status.borrow().1;
+        let dragging = self.drag.borrow().map(|d| d.id);
+        for (p, (x, y, w, h)) in &peers {
+            let (sx, sy, sw, sh) = to_screen(*x, *y, *w, *h);
+            let active =
+                matches!(control, Control::Controlling(c) | Control::ControlledBy(c) if c == p.id);
+            rounded(cr, sx + 1.5, sy + 1.5, sw - 3.0, sh - 3.0, 8.0);
+            if active {
+                cr.set_source_rgb(0.85, 0.55, 0.1);
+            } else if dragging == Some(p.id) {
+                cr.set_source_rgb(0.3, 0.68, 0.45);
+            } else {
+                cr.set_source_rgb(0.18, 0.55, 0.34);
+            }
+            let _ = cr.fill();
+            centered_text(cr, &p.name, sx + sw / 2.0, sy + sh / 2.0, sw - 12.0, false);
+            // Where the cursor crosses: the stretch of edge the two share.
+            let size = self.peer_sizes.borrow().get(&p.id).copied();
+            let span = layout::Span::new(Some(mine), Some(size.unwrap_or(mine)), p.edge, p.offset);
+            if dragging != Some(p.id)
+                && let Some((a, b)) = span.touching()
+            {
+                let (a, b) = (f64::from(a), f64::from(b));
+                let (dx0, dy0, dw, dh) = to_screen(0.0, 0.0, mw, mh);
+                let (x_a, y_a, x_b, y_b) = match p.edge {
+                    Edge::Right => (dx0 + dw, dy0 + a * dh, dx0 + dw, dy0 + b * dh),
+                    Edge::Left => (dx0, dy0 + a * dh, dx0, dy0 + b * dh),
+                    Edge::Top => (dx0 + a * dw, dy0, dx0 + b * dw, dy0),
+                    Edge::Bottom => (dx0 + a * dw, dy0 + dh, dx0 + b * dw, dy0 + dh),
+                };
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.set_line_width(4.0);
+                cr.move_to(x_a, y_a);
+                cr.line_to(x_b, y_b);
+                let _ = cr.stroke();
+            }
+        }
+    }
+
+    fn to_world(&self, x: f64, y: f64) -> (f64, f64) {
+        let (scale, ox, oy) = self.view.get();
+        ((x - ox) / scale, (y - oy) / scale)
+    }
+
+    fn drag_begin(&self, x: f64, y: f64) {
+        let (wx, wy) = self.to_world(x, y);
+        let hit = self
+            .peer_rects()
+            .into_iter()
+            .find(|(_, (rx, ry, rw, rh))| wx >= *rx && wx <= rx + rw && wy >= *ry && wy <= ry + rh);
+        *self.drag.borrow_mut() = hit.map(|(p, (rx, ry, rw, rh))| Drag {
+            id: p.id,
+            x0: rx,
+            y0: ry,
+            x: rx,
+            y: ry,
+            w: rw,
+            h: rh,
+        });
+    }
+
+    fn drag_update(&self, dx: f64, dy: f64) {
+        let (scale, _, _) = self.view.get();
+        if let Some(d) = self.drag.borrow_mut().as_mut() {
+            d.x = d.x0 + dx / scale;
+            d.y = d.y0 + dy / scale;
+        }
+        self.canvas.queue_draw();
+    }
+
+    /// Drops the dragged computer on the nearest edge, where it was let go.
+    fn drag_end(&self, dx: f64, dy: f64) {
+        let Some(d) = self.drag.borrow_mut().take() else {
+            return;
+        };
+        self.canvas.queue_draw();
+        if dx.abs() + dy.abs() < 4.0 {
+            return; // A click, not a drag.
+        }
+        let mine = self.my_size.get().unwrap_or(DEFAULT_SIZE);
+        let (edge, offset) = layout::snap(mine, (d.x, d.y, d.w, d.h));
+        let _ = self.cmd.send(Command::SetPlacement {
+            id: d.id,
+            edge,
+            offset,
+        });
+    }
+}
+
+/// A rounded rectangle path.
+fn rounded(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let pi = std::f64::consts::PI;
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -pi / 2.0, 0.0);
+    cr.arc(x + w - r, y + h - r, r, 0.0, pi / 2.0);
+    cr.arc(x + r, y + h - r, r, pi / 2.0, pi);
+    cr.arc(x + r, y + r, r, pi, 1.5 * pi);
+    cr.close_path();
+}
+
+/// White text centred at (cx, cy), shrunk to fit `max_w`.
+fn centered_text(cr: &gtk::cairo::Context, text: &str, cx: f64, cy: f64, max_w: f64, bold: bool) {
+    cr.select_font_face(
+        "Sans",
+        gtk::cairo::FontSlant::Normal,
+        if bold {
+            gtk::cairo::FontWeight::Bold
+        } else {
+            gtk::cairo::FontWeight::Normal
+        },
+    );
+    let mut size = 14.0;
+    cr.set_font_size(size);
+    if let Ok(e) = cr.text_extents(text)
+        && e.width() > max_w
+        && e.width() > 0.0
+    {
+        size = (size * max_w / e.width()).max(7.0);
+        cr.set_font_size(size);
+    }
+    if let Ok(e) = cr.text_extents(text) {
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.move_to(
+            cx - e.width() / 2.0 - e.x_bearing(),
+            cy - e.height() / 2.0 - e.y_bearing(),
+        );
+        let _ = cr.show_text(text);
     }
 }

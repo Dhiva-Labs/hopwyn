@@ -19,11 +19,12 @@ use hopwyn_input::linux::LinuxEmulator;
 use hopwyn_input::linux_capture::LinuxCapture;
 use hopwyn_input::{InputError, InputEvent};
 use hopwyn_pair::{DeviceId, Identity, PairedPeer};
-use hopwyn_proto::{Edge, Message};
-use hopwyn_transport::{Node, PeerConnection, PeerSender, TrustStore};
+use hopwyn_proto::{DecodeError, Edge, Message};
+use hopwyn_transport::{Node, PeerConnection, PeerSender, TransportError, TrustStore};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::config::{self, MAX_PARTNERS, Partner, Store};
+use crate::config::{self, AskWhen, MAX_PARTNERS, Partner, Settings, Store};
+use crate::layout::{self, Size, Span};
 use crate::pairing_net::{self, PAIRING_PORT, PAIRING_WINDOW, PairNetError};
 
 const LINK_PORT: u16 = 4242;
@@ -97,7 +98,43 @@ pub enum Command {
     },
     /// Forget a paired computer.
     Forget(DeviceId),
+    /// Share this mouse and keyboard at all (the window's switch).
+    SetSharing(bool),
+    /// When to ask for the input-capture permission.
+    SetAskWhen(AskWhen),
+    /// The window is up for the permission dialog to sit on; ask now.
+    StartInput {
+        parent: Option<String>,
+    },
+    /// Ask for the permission again after it was refused.
+    AskAgain,
+    /// This desktop's size in logical pixels (from the window's display).
+    SetScreen(Size),
+    /// Place a paired computer beyond `edge`, shifted `offset` pixels along
+    /// it (the layout editor).
+    SetPlacement {
+        id: DeviceId,
+        edge: Edge,
+        offset: i32,
+    },
     Quit,
+}
+
+/// Where the desktop's input permissions stand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputState {
+    /// Sharing is switched off: nothing asked, nothing captured.
+    Off,
+    /// Not asked yet: waiting for a paired computer to come online.
+    Waiting,
+    /// The desktop's dialog is up.
+    Asking,
+    /// Allowed: the screen edges are live.
+    Ready,
+    /// The dialog was refused or failed; asks again only when told to.
+    Refused,
+    /// Test mode: no input at all.
+    Disabled,
 }
 
 /// Who controls what, for the status card.
@@ -151,27 +188,27 @@ pub enum UiEvent {
     Error(String),
     /// The service stopped; commands no longer work.
     Fatal(String),
+    Settings(Settings),
+    Input(InputState),
+    /// Show the window (if hidden) and answer with `Command::StartInput`,
+    /// so the permission dialog has a window to open on.
+    AskPermission,
+    /// Something worth a short message.
+    Notice(String),
+    /// A paired computer's desktop size, for drawing the layout to scale.
+    PeerScreen {
+        id: DeviceId,
+        size: Size,
+    },
 }
 
-/// How long to wait for the window (to put permission dialogs on top of)
-/// before asking without one, as when Hopwyn starts hidden at login.
-const PARENT_WAIT: Duration = Duration::from_secs(3);
-
-/// Starts the service on its own thread. `parent` delivers the window the
-/// desktop's permission dialogs should sit on (see `LinuxCapture`).
-pub fn spawn(
-    ui: async_channel::Sender<UiEvent>,
-    parent: std::sync::mpsc::Receiver<Option<String>>,
-) -> mpsc::UnboundedSender<Command> {
+/// Starts the service on its own thread.
+pub fn spawn(ui: async_channel::Sender<UiEvent>) -> mpsc::UnboundedSender<Command> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("hopwyn-service".into())
         .spawn(move || {
-            let parent = parent.recv_timeout(PARENT_WAIT).ok().flatten();
-            if debug_on() {
-                eprintln!("[hopwyn {}] dialogs attach to window: {parent:?}", stamp());
-            }
-            if let Err(e) = run(&ui, rx, parent) {
+            if let Err(e) = run(&ui, rx) {
                 let _ = ui.send_blocking(UiEvent::Fatal(e));
             }
         })
@@ -182,20 +219,13 @@ pub fn spawn(
 fn run(
     ui: &async_channel::Sender<UiEvent>,
     cmds: mpsc::UnboundedReceiver<Command>,
-    parent: Option<String>,
 ) -> Result<(), String> {
     let store = Store::open_default()?;
     let identity = Arc::new(store.identity(&config::device_name())?);
     let partners = store.partners();
+    let settings = store.settings();
 
-    let (capture, capture_rx, token) = if no_input() {
-        let (_tx, rx) = std::sync::mpsc::channel();
-        (Capture(None), rx, None)
-    } else {
-        let (capture, rx, token) = start_input(ui, &store, &partners, parent)?;
-        (Capture(Some(capture)), rx, token)
-    };
-
+    // Permissions are asked later, when needed (see Service::want_input).
     let _ = ui.send_blocking(UiEvent::Ready {
         name: identity.name().to_owned(),
         short_id: identity.id().to_string(),
@@ -204,45 +234,33 @@ fn run(
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     // Service::new opens sockets, so it must run inside the runtime.
     rt.block_on(async move {
-        Service::new(
-            ui.clone(),
-            store,
-            identity,
-            partners,
-            token,
-            capture,
-            capture_rx,
-        )?
-        .run(cmds)
-        .await
+        Service::new(ui.clone(), store, identity, partners, settings)?
+            .run(cmds)
+            .await
     })
 }
+
+type InputParts = (
+    LinuxCapture,
+    std::sync::mpsc::Receiver<CaptureEvent>,
+    Option<String>,
+);
 
 /// Asks for the desktop's input permissions: capture, then remote control.
 fn start_input(
     ui: &async_channel::Sender<UiEvent>,
     store: &Store,
-    partners: &[Partner],
+    edges: Vec<Edge>,
     parent: Option<String>,
-) -> Result<
-    (
-        LinuxCapture,
-        std::sync::mpsc::Receiver<CaptureEvent>,
-        Option<String>,
-    ),
-    String,
-> {
+) -> Result<InputParts, String> {
     // Capture first: on GNOME its dialog fails to appear if requested right
     // after a remote-control session closes.
     let _ = ui.send_blocking(UiEvent::Waiting(
         "Allow Hopwyn to capture input in the desktop's dialog".into(),
     ));
-    let (capture, capture_rx) = LinuxCapture::start_with_token(
-        capture_edges(partners),
-        store.capture_token(),
-        parent.clone(),
-    )
-    .map_err(|e| e.to_string())?;
+    let (capture, capture_rx) =
+        LinuxCapture::start_with_token(edges, store.capture_token(), parent.clone())
+            .map_err(|e| e.to_string())?;
     if let Some(t) = capture.restore_token() {
         let _ = store.save_capture_token(t);
     }
@@ -264,21 +282,13 @@ fn start_input(
     Ok((capture, capture_rx, token))
 }
 
-/// The edges to put barriers on. With nothing paired, keep one on the
-/// right so the capture session stays valid; hits there are released.
-fn capture_edges(partners: &[Partner]) -> Vec<Edge> {
-    if partners.is_empty() {
-        vec![Edge::Right]
-    } else {
-        partners.iter().map(|p| p.edge).collect()
-    }
-}
-
 /// Everything the main loop reacts to besides UI commands.
 enum Internal {
     Capture(CaptureEvent),
     /// Screen-edge capture stopped (the desktop ended the session).
     CaptureEnded,
+    /// The desktop answered the permission dialogs.
+    InputReady(Result<InputParts, String>),
     /// A link to a paired computer is up.
     Connected(DeviceId, PeerSender, mpsc::UnboundedReceiver<Message>),
     /// A message on a link; the number tells a link's messages apart from
@@ -314,6 +324,9 @@ struct Pairing {
     hosting: bool,
     /// Takes the user's answer once the codes are shown.
     answer: Option<oneshot::Sender<bool>>,
+    /// Joined on its own (not clicked): if the window was already taken by
+    /// another computer, fail quietly.
+    auto: bool,
 }
 
 /// One paired computer and the state of the handoff with it.
@@ -322,6 +335,13 @@ struct Peer {
     engine: Engine,
     sender: Option<PeerSender>,
     generation: u64,
+    /// Answered a clashing Layout with ours on this link already (once per
+    /// link, so two computers can't bounce layouts forever).
+    layout_replied: bool,
+    /// Its desktop size, once it told us.
+    screen: Option<Size>,
+    /// Where the cursor should come back on this side, from its `LeaveAt`.
+    return_at: Option<f32>,
 }
 
 struct Service {
@@ -333,6 +353,10 @@ struct Service {
     connected: Arc<Mutex<HashSet<DeviceId>>>,
     token: Option<String>,
     capture: Capture,
+    settings: Settings,
+    input: InputState,
+    /// This desktop's size, from the UI.
+    my_screen: Option<Size>,
     trust: TrustStore,
     tx: mpsc::UnboundedSender<Internal>,
     rx: mpsc::UnboundedReceiver<Internal>,
@@ -352,11 +376,10 @@ impl Service {
         store: Store,
         identity: Arc<Identity>,
         partners: Vec<Partner>,
-        token: Option<String>,
-        capture: Capture,
-        capture_rx: std::sync::mpsc::Receiver<CaptureEvent>,
+        settings: Settings,
     ) -> Result<Self, String> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let store_token = store.restore_token();
         let trust = TrustStore::new();
         for p in &partners {
             trust.add(p.id);
@@ -374,17 +397,6 @@ impl Service {
         let (partners_tx, partners_rx) = watch::channel(partners.clone());
         let addresses: Arc<Mutex<HashMap<DeviceId, Vec<SocketAddr>>>> = Arc::default();
         let connected: Arc<Mutex<HashSet<DeviceId>>> = Arc::default();
-
-        // Capture events: std channel -> loop.
-        let cap_tx = tx.clone();
-        std::thread::spawn(move || {
-            while let Ok(ev) = capture_rx.recv() {
-                if cap_tx.send(Internal::Capture(ev)).is_err() {
-                    return;
-                }
-            }
-            let _ = cap_tx.send(Internal::CaptureEnded);
-        });
 
         // Discovery: keep the nearby list and paired computers' addresses current.
         let disc_tx = tx.clone();
@@ -509,6 +521,9 @@ impl Service {
                 partner,
                 sender: None,
                 generation: 0,
+                layout_replied: false,
+                screen: None,
+                return_at: None,
             })
             .collect();
         Ok(Self {
@@ -518,8 +533,17 @@ impl Service {
             peers,
             partners_tx,
             connected,
-            token,
-            capture,
+            token: store_token,
+            capture: Capture(None),
+            settings,
+            input: if no_input() {
+                InputState::Disabled
+            } else if settings.sharing {
+                InputState::Waiting
+            } else {
+                InputState::Off
+            },
+            my_screen: None,
             trust,
             tx,
             rx,
@@ -554,6 +578,9 @@ impl Service {
 
     async fn run(mut self, mut cmds: mpsc::UnboundedReceiver<Command>) -> Result<(), String> {
         self.send_ui(UiEvent::Partners(self.partners()));
+        self.send_ui(UiEvent::Settings(self.settings));
+        self.send_ui(UiEvent::Input(self.input));
+        self.want_input();
         self.publish_status();
         let mut tick = tokio::time::interval(TICK);
         loop {
@@ -587,14 +614,15 @@ impl Service {
         match ev {
             Internal::Capture(c) => self.on_capture(c).await,
             Internal::CaptureEnded => {
-                if self.capture.0.is_some() {
+                if self.capture.0.take().is_some() {
                     self.debug("capture ended");
-                    self.send_ui(UiEvent::Error(
-                        "The desktop stopped input sharing. Quit Hopwyn (Ctrl+Q) and open it again."
-                            .into(),
+                    self.set_input(InputState::Refused);
+                    self.send_ui(UiEvent::Notice(
+                        "The desktop stopped input sharing. Click Allow again to resume.".into(),
                     ));
                 }
             }
+            Internal::InputReady(result) => self.input_ready(result),
             Internal::PeerMessage(id, generation, m) => {
                 let Some(i) = self.peer_index(&id) else {
                     return;
@@ -603,21 +631,66 @@ impl Service {
                     return;
                 }
                 // Someone else has the cursor: this one keeps its own.
-                if matches!(m, Message::Enter { .. }) && self.busy().is_some_and(|b| b != i) {
+                let refuse = !self.settings.sharing || self.busy().is_some_and(|b| b != i);
+                if matches!(m, Message::Enter { .. }) && refuse {
                     self.debug(&format!("refusing Enter from {}", self.name(i)));
                     if let Some(s) = self.peers.get_mut(i).and_then(|p| p.sender.as_mut()) {
                         let _ = s.send(&Message::Leave).await;
                     }
                     return;
                 }
+                // Its desktop size, for mapping positions and drawing.
+                if let Message::Screen { width, height } = m {
+                    let size = Size { width, height };
+                    if let Some(p) = self.peers.get_mut(i) {
+                        p.screen = Some(size);
+                    }
+                    self.send_ui(UiEvent::PeerScreen { id, size });
+                    return;
+                }
                 // The other computer was rearranged: mirror it here.
-                if let Message::Layout { edge } = m {
+                let placed = match m {
+                    Message::Layout { edge } => Some((edge, None)),
+                    Message::Placement { edge, offset } => Some((edge, Some(offset))),
+                    _ => None,
+                };
+                if let Some((edge, offset)) = placed {
                     let theirs = hopwyn_core::opposite(edge);
                     self.debug(&format!(
-                        "{} says it is beyond my {theirs:?} edge",
+                        "{} says it is beyond my {theirs:?} edge (offset {offset:?})",
                         self.name(i)
                     ));
-                    let _ = self.set_edge(id, theirs);
+                    let clash = self
+                        .peers
+                        .iter()
+                        .enumerate()
+                        .any(|(j, p)| j != i && p.sender.is_some() && p.partner.edge == theirs);
+                    if clash {
+                        // Another online computer holds that side here: keep
+                        // ours and tell it, once per link.
+                        let reply = self
+                            .peers
+                            .get_mut(i)
+                            .is_some_and(|p| !std::mem::replace(&mut p.layout_replied, true));
+                        if reply {
+                            self.send_layout(i).await;
+                        }
+                    } else {
+                        let _ = self.set_edge(id, theirs);
+                        // Its top/left is `offset` along its edge, so ours is
+                        // the same distance the other way.
+                        if let (Some(o), Some(p)) = (offset, self.peers.get_mut(i)) {
+                            p.partner.offset = -o;
+                            self.partners_changed();
+                        }
+                    }
+                    return;
+                }
+                if let Message::LeaveAt { position } = m {
+                    if let Some(p) = self.peers.get_mut(i) {
+                        p.return_at = Some(position);
+                    }
+                    self.step(i, Input::Peer(Message::Leave)).await;
                     return;
                 }
                 self.step(i, Input::Peer(m)).await;
@@ -651,10 +724,27 @@ impl Service {
                     let _ = fwd.send(Internal::PeerGone(id, generation));
                 });
                 self.debug(&format!("connected to {}", self.name(i)));
+                if let Some(p) = self.peers.get_mut(i) {
+                    p.layout_replied = false;
+                }
+                let moved = self.resolve_side_conflict(i);
+                self.update_edges();
+                self.want_input();
                 self.step(i, Input::PeerConnected).await;
                 // One side's arrangement wins on connect (the lower key), so
                 // a pair can never disagree about which edges face.
-                if self.identity.id().as_bytes() < id.as_bytes() {
+                // A side just moved here because of a clash is always sent.
+                if let Some(size) = self.my_screen
+                    && let Some(sender) = self.peers.get_mut(i).and_then(|p| p.sender.as_mut())
+                {
+                    let _ = sender
+                        .send(&Message::Screen {
+                            width: size.width,
+                            height: size.height,
+                        })
+                        .await;
+                }
+                if moved || self.identity.id().as_bytes() < id.as_bytes() {
                     self.send_layout(i).await;
                 }
             }
@@ -687,17 +777,21 @@ impl Service {
                 if let Some(p) = self.pairing.as_mut() {
                     p.hosting = false;
                     p.answer = Some(answer);
+                    // The user sees this one now; its outcome gets reported.
+                    p.auto = false;
                 }
                 // The window is no longer needed: one guest at a time.
                 let _ = self.discovery.set_pairing(None, 0);
                 self.send_ui(UiEvent::PairingConfirm { name, code });
             }
             Internal::Paired(result, host) => {
-                self.pairing = None;
+                let auto = self.pairing.take().is_some_and(|p| p.auto);
                 let _ = self.discovery.set_pairing(None, 0);
                 match result {
                     Ok(peer) => self.adopt_partner(peer, host),
                     Err(PairNetError::Cancelled) => self.send_ui(UiEvent::PairingClosed),
+                    // Another computer took the window first: nothing to say.
+                    Err(e) if auto => self.debug(&format!("automatic join failed: {e}")),
                     Err(e) => self.send_ui(UiEvent::PairingFailed(e.to_string())),
                 }
             }
@@ -724,8 +818,16 @@ impl Service {
                     }
                 }
             }
-            (CaptureEvent::Activated { edge, .. }, None) => {
-                let i = self.peers.iter().position(|p| p.partner.edge == edge);
+            (CaptureEvent::Activated { edge, position }, None) => {
+                let my = self.my_screen;
+                let i = self.peers.iter().position(|p| {
+                    p.partner.edge == edge
+                        && p.sender.is_some()
+                        // Only where its screen actually touches this edge.
+                        && Span::new(my, p.screen, edge, p.partner.offset)
+                            .across(position)
+                            .is_some()
+                });
                 if i.is_none() {
                     let _ = self.capture.release();
                 }
@@ -762,8 +864,34 @@ impl Service {
             );
         }
         let edge = peer.partner.edge;
+        let span = Span::new(self.my_screen, peer.screen, edge, peer.partner.offset);
+        let return_at = peer.return_at.take();
+        // Where our cursor reached our edge on the way back, if it did.
+        let back_at = actions.iter().find_map(|a| match a {
+            Action::ReleaseCapture { position: Some(p) } if before == State::Receiving => Some(*p),
+            _ => None,
+        });
         let mut lost = false;
         for action in actions {
+            // Positions on the wire are along the receiver's edge.
+            let action = match action {
+                Action::Send(Message::Enter { edge, position }) => Action::Send(Message::Enter {
+                    edge,
+                    position: span.across(position).unwrap_or(position),
+                }),
+                Action::Send(Message::Leave) => match back_at {
+                    Some(p) => Action::Send(Message::LeaveAt {
+                        position: span.across(p).unwrap_or(p),
+                    }),
+                    None => Action::Send(Message::Leave),
+                },
+                Action::ReleaseCapture { position: None } if return_at.is_some() => {
+                    Action::ReleaseCapture {
+                        position: return_at,
+                    }
+                }
+                other => other,
+            };
             if debug_on()
                 && !matches!(
                     action,
@@ -819,6 +947,7 @@ impl Service {
         }
         self.debug(&format!("lost the link to {}", self.name(i)));
         self.step(i, Input::PeerDisconnected).await;
+        self.update_edges();
     }
 
     /// Not driven by any neighbour any more: close the remote-control
@@ -846,7 +975,7 @@ impl Service {
                     if let Some(t) = &seen.pairing {
                         self.tried.insert((id, t.clone()));
                     }
-                    self.start_guest(id, &seen);
+                    self.start_guest(id, &seen, false);
                 }
             }
             Command::SetEdge { id, edge } => {
@@ -877,8 +1006,199 @@ impl Service {
                 self.partners_changed();
                 self.publish_nearby();
             }
+            Command::SetSharing(on) => self.set_sharing(on),
+            Command::SetAskWhen(ask) => {
+                self.settings.ask = ask;
+                let _ = self.store.save_settings(self.settings);
+                self.send_ui(UiEvent::Settings(self.settings));
+                self.want_input();
+            }
+            Command::StartInput { parent } => self.start_input(parent),
+            Command::AskAgain => {
+                if self.input == InputState::Refused {
+                    self.set_input(InputState::Waiting);
+                }
+                self.want_input_now();
+            }
+            Command::SetScreen(size) => {
+                self.my_screen = Some(size);
+                for p in &mut self.peers {
+                    if let Some(sender) = p.sender.as_mut() {
+                        let _ = sender
+                            .send(&Message::Screen {
+                                width: size.width,
+                                height: size.height,
+                            })
+                            .await;
+                    }
+                }
+            }
+            Command::SetPlacement { id, edge, offset } => {
+                let moved = self.set_edge(id, edge);
+                if let Some(i) = self.peer_index(&id) {
+                    let mine = self.my_screen;
+                    if let Some(p) = self.peers.get_mut(i) {
+                        let span = Span::new(mine, p.screen, edge, 0);
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                        {
+                            p.partner.offset =
+                                layout::clamp_offset(span.mine, span.theirs, offset as f32) as i32;
+                        }
+                    }
+                    self.partners_changed();
+                    self.send_layout(i).await;
+                }
+                for j in moved {
+                    if self.peers.get(j).map(|p| p.partner.id) != Some(id) {
+                        self.send_layout(j).await;
+                    }
+                }
+            }
             Command::Quit => {}
         }
+    }
+
+    fn set_input(&mut self, state: InputState) {
+        self.input = state;
+        self.send_ui(UiEvent::Input(state));
+    }
+
+    /// Asks for the input permissions if sharing is on, they aren't held or
+    /// being asked for, and it's time: at startup, or once a paired
+    /// computer is online, as the user chose.
+    fn want_input(&mut self) {
+        let online = self.peers.iter().any(|p| p.sender.is_some());
+        if self.input == InputState::Waiting && (self.settings.ask == AskWhen::Startup || online) {
+            self.want_input_now();
+        }
+    }
+
+    fn want_input_now(&mut self) {
+        if self.input == InputState::Waiting {
+            self.set_input(InputState::Asking);
+            // The window comes up first, so the dialog has a parent.
+            self.send_ui(UiEvent::AskPermission);
+        }
+    }
+
+    /// Opens the desktop's permission dialogs on a background thread.
+    fn start_input(&mut self, parent: Option<String>) {
+        if self.input != InputState::Asking || self.capture.0.is_some() {
+            return;
+        }
+        let ui = self.ui.clone();
+        let store = self.store.clone();
+        let edges = self.online_edges();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = start_input(&ui, &store, edges, parent);
+            let _ = tx.send(Internal::InputReady(r));
+        });
+    }
+
+    fn input_ready(&mut self, result: Result<InputParts, String>) {
+        match result {
+            Ok((capture, rx, token)) => {
+                if !self.settings.sharing {
+                    return; // Switched off while the dialog was up.
+                }
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    while let Ok(ev) = rx.recv() {
+                        if tx.send(Internal::Capture(ev)).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Internal::CaptureEnded);
+                });
+                self.capture = Capture(Some(capture));
+                if token.is_some() {
+                    self.token = token;
+                }
+                self.update_edges();
+                self.set_input(InputState::Ready);
+            }
+            Err(e) => {
+                self.debug(&format!("input permission failed: {e}"));
+                self.set_input(InputState::Refused);
+            }
+        }
+    }
+
+    fn set_sharing(&mut self, on: bool) {
+        if self.settings.sharing == on {
+            return;
+        }
+        self.settings.sharing = on;
+        let _ = self.store.save_settings(self.settings);
+        self.send_ui(UiEvent::Settings(self.settings));
+        if on {
+            self.set_input(InputState::Waiting);
+            self.want_input();
+        } else {
+            // Give back anything in progress, then drop the sessions.
+            for i in 0..self.peers.len() {
+                self.reset_engine(i);
+            }
+            self.capture = Capture(None);
+            self.emulator = None;
+            self.set_input(InputState::Off);
+        }
+    }
+
+    /// Edges of the computers online now. With none, keep one barrier on
+    /// the right so the capture session stays valid; hits there are released.
+    fn online_edges(&self) -> Vec<Edge> {
+        let mut edges: Vec<Edge> = self
+            .peers
+            .iter()
+            .filter(|p| p.sender.is_some())
+            .map(|p| p.partner.edge)
+            .collect();
+        edges.dedup();
+        if edges.is_empty() {
+            edges.push(Edge::Right);
+        }
+        edges
+    }
+
+    fn update_edges(&self) {
+        let _ = self.capture.set_edges(self.online_edges());
+    }
+
+    /// Computer `i` just came online on a side another online computer
+    /// holds (they normally never meet, like home and office desktops):
+    /// move it to a free side and say so.
+    fn resolve_side_conflict(&mut self, i: usize) -> bool {
+        let Some(edge) = self.peers.get(i).map(|p| p.partner.edge) else {
+            return false;
+        };
+        let taken: Vec<Edge> = self
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(j, p)| *j != i && p.sender.is_some())
+            .map(|(_, p)| p.partner.edge)
+            .collect();
+        if !taken.contains(&edge) {
+            return false;
+        }
+        let Some(free) = ALL_EDGES.into_iter().find(|e| !taken.contains(e)) else {
+            return false;
+        };
+        {
+            if let Some(p) = self.peers.get_mut(i) {
+                p.partner.edge = free;
+            }
+            self.reset_engine(i);
+            self.partners_changed();
+            self.send_ui(UiEvent::Notice(format!(
+                "{} was on the same side as another computer; moved it to the {} side. Drag it to change.",
+                self.name(i),
+                config::edge_name(free)
+            )));
+        }
+        true
     }
 
     /// Places computer `id` beyond `edge`; whoever was there takes its old
@@ -894,7 +1214,12 @@ impl Service {
             return Vec::new();
         }
         let mut moved = vec![i];
-        if let Some(j) = self.peers.iter().position(|p| p.partner.edge == edge) {
+        // Only an online computer holds a side; offline ones may share it.
+        if let Some(j) = self
+            .peers
+            .iter()
+            .position(|p| p.partner.edge == edge && p.sender.is_some() && p.partner.id != id)
+        {
             if let Some(p) = self.peers.get_mut(j) {
                 p.partner.edge = old;
             }
@@ -914,8 +1239,9 @@ impl Service {
         let Some(peer) = self.peers.get_mut(i) else {
             return;
         };
-        let msg = Message::Layout {
+        let msg = Message::Placement {
             edge: peer.partner.edge,
+            offset: peer.partner.offset,
         };
         if let Some(s) = peer.sender.as_mut() {
             let _ = s.send(&msg).await;
@@ -926,7 +1252,7 @@ impl Service {
     fn partners_changed(&mut self) {
         let partners = self.partners();
         let _ = self.store.save_partners(&partners);
-        let _ = self.capture.set_edges(capture_edges(&partners));
+        self.update_edges();
         let _ = self.partners_tx.send(partners.clone());
         self.send_ui(UiEvent::Partners(partners));
     }
@@ -973,11 +1299,12 @@ impl Service {
             task,
             hosting: true,
             answer: None,
+            auto: false,
         });
     }
 
     /// Joins a nearby computer's open pairing window.
-    fn start_guest(&mut self, id: DeviceId, seen: &Seen) {
+    fn start_guest(&mut self, id: DeviceId, seen: &Seen, auto: bool) {
         if self.peers.len() >= MAX_PARTNERS && self.peer_index(&id).is_none() {
             self.send_ui(UiEvent::PairingFailed(full_message()));
             return;
@@ -1013,6 +1340,7 @@ impl Service {
             task,
             hosting: false,
             answer: None,
+            auto,
         });
     }
 
@@ -1059,7 +1387,7 @@ impl Service {
             Some(_) => return,
         }
         self.tried.insert((id, token));
-        self.start_guest(id, &seen);
+        self.start_guest(id, &seen, true);
     }
 
     fn adopt_partner(&mut self, peer: PairedPeer, initiator: bool) {
@@ -1076,7 +1404,12 @@ impl Service {
         // right, the newcomer has it on its left; otherwise the first free
         // side. Either can change it.
         let preferred = if initiator { Edge::Right } else { Edge::Left };
-        let taken: Vec<Edge> = self.peers.iter().map(|p| p.partner.edge).collect();
+        let taken: Vec<Edge> = self
+            .peers
+            .iter()
+            .filter(|p| p.sender.is_some())
+            .map(|p| p.partner.edge)
+            .collect();
         let Some(edge) = std::iter::once(preferred)
             .chain(ALL_EDGES)
             .find(|e| !taken.contains(e))
@@ -1088,6 +1421,7 @@ impl Service {
             id: peer.id,
             name: peer.name.clone(),
             edge,
+            offset: 0,
         };
         self.trust.add(peer.id);
         self.peers.push(Peer {
@@ -1095,6 +1429,9 @@ impl Service {
             partner,
             sender: None,
             generation: 0,
+            layout_replied: false,
+            screen: None,
+            return_at: None,
         });
         self.partners_changed();
         self.send_ui(UiEvent::PairingDone(peer.name));
@@ -1238,9 +1575,17 @@ fn hand_over(conn: PeerConnection, tx: &mpsc::UnboundedSender<Internal>) -> Resu
     let (sender, mut receiver) = conn.split();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        while let Ok(m) = receiver.recv().await {
-            if msg_tx.send(m).is_err() {
-                return;
+        loop {
+            match receiver.recv().await {
+                Ok(m) => {
+                    if msg_tx.send(m).is_err() {
+                        return;
+                    }
+                }
+                // A message from a newer version: the frame was read whole,
+                // so skip it and keep the link.
+                Err(TransportError::Decode(DecodeError::UnknownTag(_))) => {}
+                Err(_) => return,
             }
         }
     });

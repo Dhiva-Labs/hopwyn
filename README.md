@@ -37,16 +37,16 @@ scripts/install-linux.sh --uninstall
 
 Then open **Hopwyn** from your app launcher on both computers:
 
-1. Allow the two desktop permission dialogs (capture input, then remote control). Remote control is asked only once. GNOME 50 and older can't remember the capture permission, so it is asked once each time you log in; Hopwyn keeps running when you close its window so it isn't asked again. Desktops with InputCapture portal version 2 remember it too.
+1. When a paired computer comes online, allow the desktop's permission dialogs (capture input, then remote control). Remote control is asked only once. GNOME 50 and older forget the capture permission at logout, so by default Hopwyn asks for it only when it's needed: once per session, when a paired computer is online. Change this under **Sharing → Ask for permission** ("When needed" or "At startup"), or switch **Share mouse and keyboard** off to stop sharing entirely. Desktops with InputCapture portal version 2 remember the permission too.
 2. On one computer click **Add computer** (it stays open for 2 minutes).
 3. The other computer pops up a pairing dialog on its own within a few seconds. Check both screens show the same 6-digit code and click **Pair** on both. (If you dismissed it, click **Pair** next to the computer under **Nearby**.)
-4. In the layout picture, drag the other computer (or click it, then click a side) to where its screen really is; the other computer updates to match. Then move the cursor off that edge. Repeat with **Add computer** for up to 4 computers, one on each side.
+4. In the layout picture, drag the other computer to where its screen really is: any side, and slid along the edge to line up screens of different sizes. The picture is to scale, shows each of your monitors, and marks where the screens touch; the cursor crosses only there and lands at the matching spot. The other computer updates to match. Repeat with **Add computer** for more computers.
 
 **Ctrl+Alt+Esc** always gives your cursor back. The firewall must allow UDP 4242 (link), UDP 5353 (discovery) and, while pairing, TCP 4243 between the computers.
 
 ### Testing on one machine
 
-`HOPWYN_NO_INPUT=1` skips the desktop's input permissions so several copies can run side by side to test discovery, pairing and the window (not the cursor handoff). Give each its own `XDG_CONFIG_HOME`, `HOPWYN_NAME`, `HOPWYN_LINK_PORT` and `HOPWYN_PAIRING_PORT`; GTK's broadway backend (`gtk4-broadwayd --address 127.0.0.1 :5`, then `GDK_BACKEND=broadway BROADWAY_DISPLAY=:5`) shows each in a browser tab.
+`scripts/test-copies.sh <state-dir> [count]` runs up to four input-free copies side by side (`HOPWYN_NO_INPUT=1`, each with its own settings, name and ports), each shown in a browser tab through GTK's broadway backend at `http://127.0.0.1:8085` and up. They test discovery, pairing, layout sync and the window, not the cursor handoff. `scripts/test-copies.sh --stop` ends them.
 
 ## Releases
 
@@ -60,7 +60,8 @@ Then open **Hopwyn** from your app launcher on both computers:
 - **iOS cannot be controlled from a computer.** Apple does not allow apps to inject input into the system, so an iPhone or iPad can act as a trackpad and keyboard for your computers and share the clipboard and files, but your computer's mouse cannot move onto it. Android does not have this limit.
 - **Linux Wayland** needs a desktop with the InputCapture portal (GNOME 45+, KDE Plasma 6.1+) to send input. Older desktops can still receive input.
 - **Home network only.** Hopwyn refuses connections from public IP addresses and has no relay servers.
-- **Up to 4 paired computers**, one beyond each edge of the screen. Each computer's own mouse can reach its neighbours; passing the cursor on through a neighbour to the computer beyond it is not supported yet.
+- **Up to 16 paired computers**, at most one online per side at a time. Computers that are never on together (a home and an office desktop) can share a side; if two meet, the newcomer moves to a free side. Each computer's own mouse can reach its neighbours; passing the cursor on through a neighbour to the computer beyond it is not supported yet.
+- **Both computers need the same release.** Builds before this one drop the link when they receive the new layout messages; from this release on, unknown messages are skipped.
 - **Hidden permission dialogs.** GNOME may open the permission dialogs behind other windows; press the Super key to find them.
 
 ## Repository layout
