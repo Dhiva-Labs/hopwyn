@@ -1,6 +1,11 @@
 package app.hopwyn.android
 
+import android.view.HapticFeedbackConstants
 import androidx.compose.foundation.background
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -9,6 +14,8 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -53,8 +60,15 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 
-/** Pointer speed: computer pixels per finger pixel. */
-private const val SPEED = 1.6f
+// The trackpad is always dark, like the real thing, whatever the phone's theme.
+private val Pad = Color(0xFF0E131C)
+private val Key = Color(0xFF1A212D)
+private val Pressed = Color(0xFF2A3446)
+private val Glow = Color(0x403B78F0)
+private val Live = Color(0xFF5FD3A2)
+private val Muted = Color(0xFF97A1B2)
+private val Hint = Color(0xFF5E6878)
+
 /** Finger pixels per scrolled line. */
 private const val PX_PER_LINE = 28f
 /** Longest touch that still counts as a tap, and how far it may move. */
@@ -67,7 +81,7 @@ private const val TAP_SLOP = 14f
  * dragging. The keyboard types on the computer.
  */
 @Composable
-fun Trackpad(name: String, onDone: () -> Unit) {
+fun Trackpad(name: String, prefs: Prefs, onDone: () -> Unit) {
     ReleaseOnBack(onDone)
     val view = LocalView.current
     DisposableEffect(Unit) {
@@ -76,20 +90,33 @@ fun Trackpad(name: String, onDone: () -> Unit) {
     }
     var typing by remember { mutableStateOf(false) }
 
-    Surface(color = Color(0xFF101318), modifier = Modifier.fillMaxSize()) {
+    Surface(color = Pad, modifier = Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()) {
             Row(
                 Modifier.fillMaxWidth().padding(16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("Controlling", color = Color(0xFF9AA4B2), style = MaterialTheme.typography.labelMedium)
-                    Text(name, color = Color.White, style = MaterialTheme.typography.titleLarge)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(8.dp).clip(CircleShape).background(Live))
+                        Text(
+                            "  Controlling",
+                            color = Muted,
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                    }
+                    Text(
+                        name,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleLarge,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
                 }
                 Button(onClick = onDone) { Text("Done") }
             }
 
-            TouchSurface(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp))
+            TouchSurface(prefs, Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp))
 
             if (typing) KeyBar()
 
@@ -97,11 +124,20 @@ fun Trackpad(name: String, onDone: () -> Unit) {
                 Modifier.fillMaxWidth().padding(12.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                MouseButton("Left", 0, Modifier.weight(1f))
-                HoldButton(Modifier.weight(1f))
-                MouseButton("Right", 1, Modifier.weight(1f))
-                FilledTonalButton(onClick = { typing = !typing }) {
-                    Icon(Icons.Filled.Keyboard, "Keyboard")
+                Row(
+                    Modifier.weight(1f).height(56.dp).clip(RoundedCornerShape(18.dp)),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    MouseButton("Left", 0, Modifier.weight(1f))
+                    MouseButton("Right", 1, Modifier.weight(1f))
+                }
+                HoldButton(Modifier.height(56.dp))
+                FilledTonalButton(
+                    onClick = { typing = !typing },
+                    modifier = Modifier.height(56.dp),
+                    shape = RoundedCornerShape(18.dp),
+                ) {
+                    Icon(Icons.Filled.Keyboard, if (typing) "Hide keyboard" else "Show keyboard")
                 }
             }
             if (typing) HiddenKeyboard()
@@ -110,13 +146,26 @@ fun Trackpad(name: String, onDone: () -> Unit) {
 }
 
 @Composable
-private fun TouchSurface(modifier: Modifier) {
+private fun TouchSurface(prefs: Prefs, modifier: Modifier) {
+    val view = LocalView.current
+    var touch by remember { mutableStateOf<Offset?>(null) }
     Box(
         modifier
-            .background(Color(0xFF1B2029), RoundedCornerShape(20.dp))
+            .clip(RoundedCornerShape(24.dp))
+            .background(Key)
+            .drawBehind {
+                touch?.let {
+                    drawCircle(
+                        Brush.radialGradient(listOf(Glow, Color.Transparent), center = it, radius = 90.dp.toPx()),
+                        radius = 90.dp.toPx(),
+                        center = it,
+                    )
+                }
+            }
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
+                    touch = down.position
                     val start = down.uptimeMillis
                     var end = start
                     var last: Map<PointerId, Offset> = mapOf(down.id to down.position)
@@ -132,7 +181,8 @@ private fun TouchSurface(modifier: Modifier) {
                             last[c.id]?.let { prev ->
                                 val d = c.position - prev
                                 travelled += d.getDistance()
-                                Native.nativeMotion(d.x * SPEED, d.y * SPEED)
+                                val speed = prefs.pointerSpeed
+                                Native.nativeMotion(d.x * speed, d.y * speed)
                             }
                         } else if (pressed.size >= 2) {
                             var sum = Offset.Zero
@@ -141,8 +191,8 @@ private fun TouchSurface(modifier: Modifier) {
                             if (n > 0) {
                                 val d = sum / n.toFloat()
                                 travelled += d.getDistance()
-                                // Natural scrolling, like the phone itself.
-                                scrollCarry += d
+                                // Natural scrolling moves content with the fingers.
+                                scrollCarry += if (prefs.naturalScroll) d else -d
                                 val lines = Offset(-scrollCarry.x / PX_PER_LINE, -scrollCarry.y / PX_PER_LINE)
                                 val whole = Offset(lines.x.toInt().toFloat(), lines.y.toInt().toFloat())
                                 if (whole != Offset.Zero) {
@@ -152,6 +202,7 @@ private fun TouchSurface(modifier: Modifier) {
                             }
                         }
                         last = pressed.associate { it.id to it.position }
+                        touch = pressed.firstOrNull()?.position
                         event.changes.forEach {
                             if (!it.pressed) end = it.uptimeMillis
                             it.consume()
@@ -161,14 +212,17 @@ private fun TouchSurface(modifier: Modifier) {
                         val button = if (maxFingers >= 2) 1 else 0
                         Native.nativeButton(button, true)
                         Native.nativeButton(button, false)
+                        view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                     }
+                    touch = null
                 }
             },
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            "Move with one finger · tap to click\nTwo fingers: scroll · tap to right-click",
-            color = Color(0xFF5C6675),
+            "Move with one finger, tap to click.\nScroll with two fingers, tap with two to right-click.",
+            color = Hint,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
             style = MaterialTheme.typography.bodySmall,
         )
     }
@@ -176,13 +230,24 @@ private fun TouchSurface(modifier: Modifier) {
 
 @Composable
 private fun MouseButton(label: String, button: Int, modifier: Modifier) {
-    OutlinedButton(onClick = {}, modifier = modifier.pointerInput(Unit) {
-        detectTapGestures(onPress = {
-            Native.nativeButton(button, true)
-            tryAwaitRelease()
-            Native.nativeButton(button, false)
-        })
-    }) { Text(label, color = Color.White) }
+    val view = LocalView.current
+    var down by remember { mutableStateOf(false) }
+    Box(
+        modifier
+            .fillMaxHeight()
+            .background(if (down) Pressed else Key)
+            .pointerInput(Unit) {
+                detectTapGestures(onPress = {
+                    down = true
+                    Native.nativeButton(button, true)
+                    view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    tryAwaitRelease()
+                    Native.nativeButton(button, false)
+                    down = false
+                })
+            },
+        contentAlignment = Alignment.Center,
+    ) { Text(label, color = Color.White, style = MaterialTheme.typography.labelLarge) }
 }
 
 /** Toggles the left button held, for dragging with one finger. */
@@ -194,9 +259,11 @@ private fun HoldButton(modifier: Modifier) {
         Native.nativeButton(0, held)
     }
     if (held) {
-        Button(onClick = toggle, modifier = modifier) { Text("Drop") }
+        Button(onClick = toggle, modifier = modifier, shape = RoundedCornerShape(18.dp)) { Text("Drop") }
     } else {
-        OutlinedButton(onClick = toggle, modifier = modifier) { Text("Hold", color = Color.White) }
+        OutlinedButton(onClick = toggle, modifier = modifier, shape = RoundedCornerShape(18.dp)) {
+            Text("Hold", color = Color.White)
+        }
     }
     DisposableEffect(Unit) { onDispose { if (held) Native.nativeButton(0, false) } }
 }

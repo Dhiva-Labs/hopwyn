@@ -2,7 +2,9 @@
 # Builds the Android app: the Rust core for each phone CPU, then the APK.
 # Needs the Android SDK and NDK (ANDROID_HOME, default ~/Android/Sdk) and
 # cargo-ndk (cargo install cargo-ndk).
-# Usage: scripts/build-android.sh [debug|release]   (default release)
+# Usage: scripts/build-android.sh [debug|release|bundle]   (default release)
+#   bundle: the Play Store App Bundle (.aab), signed with the upload key
+#   from android/keystore.properties when present.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,6 +24,10 @@ cd android
 if [[ "$KIND" == "debug" ]]; then
   ./gradlew assembleDebug --console=plain -q
   ls app/build/outputs/apk/debug/*.apk
+elif [[ "$KIND" == "bundle" ]]; then
+  [[ -f keystore.properties ]] || echo "warning: no android/keystore.properties; signing with the debug key (Play will refuse it)" >&2
+  ./gradlew bundleRelease --console=plain -q
+  ls app/build/outputs/bundle/release/*.aab
 else
   ./gradlew assembleRelease --console=plain -q
   ls app/build/outputs/apk/release/*.apk

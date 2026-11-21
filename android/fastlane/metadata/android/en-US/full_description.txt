@@ -1,0 +1,17 @@
+Hopwyn joins your phone and computers into one desk.
+
+Use your phone as a trackpad and keyboard
+Tap a computer and your phone becomes its trackpad: one finger moves the pointer, a tap clicks, two fingers scroll or right-click. Open the keyboard to type on the computer, with keys for Esc, Tab, the arrows and Enter.
+
+Control your phone from your computer
+Move your computer's pointer off the edge of its screen and it appears on your phone. Clicks tap, drags swipe, the scroll wheel scrolls and your keyboard types into the selected text field. Move back over the edge to return. This uses Android's Accessibility service, which you turn on yourself; Hopwyn explains exactly what it does first.
+
+Pairing without typing
+Hopwyn finds your computers on your home Wi-Fi. Click Add computer on one device and the other asks on its own. Check both show the same six-digit code and tap Pair.
+
+Private by design
+- No account, no cloud, no ads, no analytics.
+- Everything stays on your home network, end-to-end encrypted.
+- Open source under the Apache License 2.0.
+
+Needs Hopwyn on your computer: Linux today (Ubuntu PPA and Snap Store), with Windows and macOS coming.

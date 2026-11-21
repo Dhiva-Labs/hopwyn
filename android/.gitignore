@@ -5,3 +5,6 @@
 /.kotlin/
 # Built from crates/hopwyn-mobile by scripts/build-android.sh
 /app/src/main/jniLibs/
+/keystore.properties
+*.jks
+*.keystore

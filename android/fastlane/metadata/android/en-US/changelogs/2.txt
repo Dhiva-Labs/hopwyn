@@ -1,0 +1,1 @@
+Redesigned app: see your devices at a glance, Settings with light and dark themes, pointer speed and natural scrolling, and a clearer pairing code.
