@@ -200,6 +200,8 @@ pub enum UiEvent {
         id: DeviceId,
         size: Size,
     },
+    /// That paired device is a phone remote (no screen edge).
+    Remote(DeviceId),
 }
 
 /// Starts the service on its own thread.
@@ -342,6 +344,9 @@ struct Peer {
     screen: Option<Size>,
     /// Where the cursor should come back on this side, from its `LeaveAt`.
     return_at: Option<f32>,
+    /// A phone used as trackpad and keyboard: it controls this computer but
+    /// can't be controlled, so it holds no screen edge.
+    remote: bool,
 }
 
 struct Service {
@@ -524,6 +529,7 @@ impl Service {
                 layout_replied: false,
                 screen: None,
                 return_at: None,
+                remote: false,
             })
             .collect();
         Ok(Self {
@@ -637,6 +643,15 @@ impl Service {
                     if let Some(s) = self.peers.get_mut(i).and_then(|p| p.sender.as_mut()) {
                         let _ = s.send(&Message::Leave).await;
                     }
+                    return;
+                }
+                if matches!(m, Message::Remote) {
+                    if let Some(p) = self.peers.get_mut(i) {
+                        p.remote = true;
+                    }
+                    self.debug(&format!("{} is a remote", self.name(i)));
+                    self.update_edges();
+                    self.send_ui(UiEvent::Remote(id));
                     return;
                 }
                 // Its desktop size, for mapping positions and drawing.
@@ -782,6 +797,15 @@ impl Service {
                 }
                 // The window is no longer needed: one guest at a time.
                 let _ = self.discovery.set_pairing(None, 0);
+                // Test mode only: accept on this side without a click, so
+                // pairing can be tested end to end unattended.
+                if no_input() && std::env::var_os("HOPWYN_TEST_AUTO_PAIR").is_some() {
+                    self.debug(&format!("test: accepting pairing with {name} ({code})"));
+                    if let Some(a) = self.pairing.as_mut().and_then(|p| p.answer.take()) {
+                        let _ = a.send(true);
+                    }
+                    return;
+                }
                 self.send_ui(UiEvent::PairingConfirm { name, code });
             }
             Internal::Paired(result, host) => {
@@ -823,6 +847,7 @@ impl Service {
                 let i = self.peers.iter().position(|p| {
                     p.partner.edge == edge
                         && p.sender.is_some()
+                        && !p.remote
                         // Only where its screen actually touches this edge.
                         && Span::new(my, p.screen, edge, p.partner.offset)
                             .across(position)
@@ -1152,7 +1177,7 @@ impl Service {
         let mut edges: Vec<Edge> = self
             .peers
             .iter()
-            .filter(|p| p.sender.is_some())
+            .filter(|p| p.sender.is_some() && !p.remote)
             .map(|p| p.partner.edge)
             .collect();
         edges.dedup();
@@ -1177,7 +1202,7 @@ impl Service {
             .peers
             .iter()
             .enumerate()
-            .filter(|(j, p)| *j != i && p.sender.is_some())
+            .filter(|(j, p)| *j != i && p.sender.is_some() && !p.remote)
             .map(|(_, p)| p.partner.edge)
             .collect();
         if !taken.contains(&edge) {
@@ -1432,6 +1457,7 @@ impl Service {
             layout_replied: false,
             screen: None,
             return_at: None,
+            remote: false,
         });
         self.partners_changed();
         self.send_ui(UiEvent::PairingDone(peer.name));

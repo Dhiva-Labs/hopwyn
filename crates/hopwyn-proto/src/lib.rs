@@ -66,6 +66,10 @@ pub enum Message {
     Key { code: u16, pressed: bool },
     /// New clipboard text from the sender.
     ClipboardText { text: String },
+    /// The sender is a remote (a phone used as trackpad and keyboard): it
+    /// takes control with `Enter` but can't be controlled, so it needs no
+    /// screen edge.
+    Remote,
     /// The sender's whole desktop size in logical pixels, for drawing the
     /// layout to scale and mapping positions between unequal screens.
     Screen { width: u32, height: u32 },

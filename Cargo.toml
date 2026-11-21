@@ -6,6 +6,7 @@ members = [
     "crates/hopwyn-daemon",
     "crates/hopwyn-discovery",
     "crates/hopwyn-input",
+    "crates/hopwyn-mobile",
     "crates/hopwyn-pair",
     "crates/hopwyn-proto",
     "crates/hopwyn-transport",

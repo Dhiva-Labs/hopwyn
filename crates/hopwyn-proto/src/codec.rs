@@ -14,6 +14,7 @@ mod tag {
     pub const LAYOUT: u8 = 0x40;
     pub const SCREEN: u8 = 0x41;
     pub const PLACEMENT: u8 = 0x42;
+    pub const REMOTE: u8 = 0x43;
     pub const LEAVE_AT: u8 = 0x04;
     pub const HEARTBEAT: u8 = 0x70;
     pub const DISCONNECT: u8 = 0x7f;
@@ -101,6 +102,7 @@ pub(crate) fn encode(msg: &Message, out: &mut Vec<u8>) {
             out.push(tag::LEAVE_AT);
             out.extend_from_slice(&position.to_le_bytes());
         }
+        Message::Remote => out.push(tag::REMOTE),
         Message::Screen { width, height } => {
             out.push(tag::SCREEN);
             out.extend_from_slice(&width.to_le_bytes());
@@ -165,6 +167,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message, DecodeError> {
             }
             Message::LeaveAt { position }
         }
+        tag::REMOTE => Message::Remote,
         tag::SCREEN => {
             let (width, height) = (r.u32()?, r.u32()?);
             // Bounded so layout arithmetic can't overflow.
@@ -355,6 +358,7 @@ mod tests {
             Message::Heartbeat { seq: 42 },
             Message::Layout { edge: Edge::Top },
             Message::LeaveAt { position: 0.25 },
+            Message::Remote,
             Message::Screen {
                 width: 2560,
                 height: 1440,

@@ -118,6 +118,8 @@ struct Ui {
     my_size: Cell<Option<Size>>,
     monitors: RefCell<Vec<(f64, f64, f64, f64)>>,
     peer_sizes: RefCell<HashMap<DeviceId, Size>>,
+    /// Paired phones used as remotes: no side to choose, not in the picture.
+    remotes: RefCell<std::collections::HashSet<DeviceId>>,
     drag: RefCell<Option<Drag>>,
     /// Canvas transform from the last draw: (scale, x origin, y origin).
     view: Cell<(f64, f64, f64)>,
@@ -348,6 +350,7 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         my_size: Cell::new(None),
         monitors: RefCell::new(Vec::new()),
         peer_sizes: RefCell::new(HashMap::new()),
+        remotes: RefCell::new(std::collections::HashSet::new()),
         drag: RefCell::new(None),
         view: Cell::new((1.0, 0.0, 0.0)),
         partner_rows: RefCell::new(Vec::new()),
@@ -534,6 +537,10 @@ impl Ui {
                 }
             }
             UiEvent::Notice(text) => self.toast(&text),
+            UiEvent::Remote(id) => {
+                self.remotes.borrow_mut().insert(id);
+                self.refresh_partners();
+            }
             UiEvent::PeerScreen { id, size } => {
                 self.peer_sizes.borrow_mut().insert(id, size);
                 self.canvas.queue_draw();
@@ -750,7 +757,11 @@ impl Ui {
                 .tooltip_text(format!("Where {}'s screen is", p.name))
                 .build();
             side.set_selected(edge_index(p.edge));
-            row.add_suffix(&side);
+            if self.remotes.borrow().contains(&p.id) {
+                row.set_title(&format!("{} (phone remote)", p.name));
+            } else {
+                row.add_suffix(&side);
+            }
             let forget = gtk::Button::builder()
                 .icon_name("user-trash-symbolic")
                 .tooltip_text(format!("Forget {}", p.name))
@@ -1046,7 +1057,7 @@ impl Ui {
         self.partners
             .borrow()
             .iter()
-            .filter(|p| connected.contains(&p.id))
+            .filter(|p| connected.contains(&p.id) && !self.remotes.borrow().contains(&p.id))
             .map(|p| {
                 let size = sizes.get(&p.id).copied().unwrap_or(mine);
                 let (w, h) = (f64::from(size.width), f64::from(size.height));
