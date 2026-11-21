@@ -1516,7 +1516,10 @@ impl Service {
     }
 
     fn push_to_edge(&mut self, edge: Edge) {
-        if self.emulator.is_none() && self.capture.0.is_some() {
+        // Being driven needs only the remote-control session (its token was
+        // saved the first time), not screen-edge capture: a phone remote
+        // drives this computer while capture may never have been asked for.
+        if self.emulator.is_none() && !no_input() {
             let restore = self.token.clone();
             match tokio::task::block_in_place(|| LinuxEmulator::connect(restore.as_deref())) {
                 Ok(e) => {
