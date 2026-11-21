@@ -26,7 +26,7 @@ sudo snap install hopwyn --edge
 
 ### Android (developer preview)
 
-Your phone becomes a trackpad and keyboard for your computers: one finger moves, a tap clicks, two fingers scroll or right-click, and the keyboard types on the computer. Pair it like a computer (tap **Pair a computer** on the phone, or click **Add computer** on the computer), then tap **Use**. Build the APK with `scripts/build-android.sh` (needs the Android SDK and NDK and `cargo install cargo-ndk`), or install a release APK. Being controlled from a computer's mouse comes next.
+Your phone becomes a trackpad and keyboard for your computers: one finger moves, a tap clicks, two fingers scroll or right-click, and the keyboard types on the computer. Pair it like a computer (tap **Pair a computer** on the phone, or click **Add computer** on the computer), then tap **Use**. Build the APK with `scripts/build-android.sh` (needs the Android SDK and NDK and `cargo install cargo-ndk`), or install a release APK. To use your computer's mouse and keyboard on the phone, turn on Hopwyn under **Settings → Accessibility** (on Android 13 and later, first allow it under **Settings → Apps → Hopwyn → ⋮ → Allow restricted settings**). Then drag the phone into place in the computer's layout picture and move the pointer off that edge: clicks tap, drags swipe, the wheel scrolls, right-click is Back, the Super key is Home, and typing goes into the focused text field. Move back over the edge to return.
 
 ### From source
 

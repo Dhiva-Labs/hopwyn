@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -148,6 +149,8 @@ fun Home(model: HopwynModel) {
                 }
             }
 
+            item { ControlCard(model.controllable) }
+
             item { SectionTitle("Paired computers") }
             if (model.computers.isEmpty()) {
                 item {
@@ -236,6 +239,37 @@ fun Home(model: HopwynModel) {
                 TextButton(onClick = { model.forget(c.id); forgetting = null }) { Text("Forget") }
             },
             dismissButton = { TextButton(onClick = { forgetting = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+/** Status of "computers can control this phone", with a way to turn it on. */
+@Composable
+private fun ControlCard(on: Boolean) {
+    val context = LocalContext.current
+    Card(Modifier.fillMaxWidth()) {
+        ListItem(
+            leadingContent = { Icon(Icons.Filled.Mouse, null) },
+            headlineContent = { Text("Control this phone from a computer") },
+            supportingContent = {
+                Text(
+                    if (on) {
+                        "On: move the computer's pointer off the edge where this phone sits."
+                    } else {
+                        "Turn on Hopwyn in Accessibility settings to use your computer's mouse and keyboard here. It also keeps Hopwyn connected when closed."
+                    },
+                )
+            },
+            trailingContent = {
+                if (!on) {
+                    Button(onClick = {
+                        context.startActivity(
+                            android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    }) { Text("Turn on") }
+                }
+            },
         )
     }
 }

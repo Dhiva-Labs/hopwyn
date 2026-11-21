@@ -204,3 +204,36 @@ pub extern "system" fn Java_app_hopwyn_android_Native_nativeText<'l>(
     let text = string(&mut env, &text);
     send(Command::Text(text));
 }
+
+/// Whether computers may drive this phone (the Accessibility service is
+/// on), with the screen size in pixels.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_hopwyn_android_Native_nativeSetControllable<'l>(
+    _env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    enabled: jboolean,
+    width: jint,
+    height: jint,
+) {
+    send(Command::SetControllable {
+        enabled: enabled != 0,
+        width: u32::try_from(width).unwrap_or(0),
+        height: u32::try_from(height).unwrap_or(0),
+    });
+}
+
+/// The next on-screen action while a computer drives the phone, waiting up
+/// to `timeout_ms`, or null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_hopwyn_android_Native_nativeNextControl<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    timeout_ms: jint,
+) -> jstring {
+    let wait = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
+    let line = CORE
+        .get()
+        .and_then(|m| m.next_control(wait))
+        .map(|c| c.to_line());
+    to_java(&mut env, line)
+}

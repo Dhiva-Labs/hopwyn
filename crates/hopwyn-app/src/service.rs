@@ -669,8 +669,17 @@ impl Service {
                 // Its desktop size, for mapping positions and drawing.
                 if let Message::Screen { width, height } = m {
                     let size = Size { width, height };
+                    let was_remote = self.peers.get(i).is_some_and(|p| p.remote);
                     if let Some(p) = self.peers.get_mut(i) {
                         p.screen = Some(size);
+                        // A phone that offers its screen can be driven: it
+                        // sits beyond an edge like any computer.
+                        p.remote = false;
+                    }
+                    if was_remote {
+                        self.debug(&format!("{} can be driven now", self.name(i)));
+                        self.resolve_side_conflict(i);
+                        self.update_edges();
                     }
                     self.send_ui(UiEvent::PeerScreen { id, size });
                     return;

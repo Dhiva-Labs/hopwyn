@@ -64,8 +64,55 @@ pub fn for_char(c: char) -> Option<(u16, bool)> {
     })
 }
 
+/// Shift keys (left, right): held while typing capitals and symbols.
+pub fn is_shift(code: u16) -> bool {
+    code == SHIFT || code == 0xe5
+}
+
+/// The Windows/Super keys (left, right).
+pub fn is_super(code: u16) -> bool {
+    code == 0xe3 || code == 0xe7
+}
+
+/// The character a key types on a US keyboard, the reverse of [`for_char`]
+/// (letters, digits, symbols, space). `None` for keys that type nothing.
+pub fn to_char(code: u16, shift: bool) -> Option<char> {
+    if (0x04..=0x1d).contains(&code) {
+        let c = char::from(b'a' + u8::try_from(code - 0x04).ok()?);
+        return Some(if shift { c.to_ascii_uppercase() } else { c });
+    }
+    let (plain, shifted) = match code {
+        0x1e => ('1', '!'),
+        0x1f => ('2', '@'),
+        0x20 => ('3', '#'),
+        0x21 => ('4', '$'),
+        0x22 => ('5', '%'),
+        0x23 => ('6', '^'),
+        0x24 => ('7', '&'),
+        0x25 => ('8', '*'),
+        0x26 => ('9', '('),
+        0x27 => ('0', ')'),
+        0x2c => (' ', ' '),
+        0x2d => ('-', '_'),
+        0x2e => ('=', '+'),
+        0x2f => ('[', '{'),
+        0x30 => (']', '}'),
+        0x31 => ('\\', '|'),
+        0x33 => (';', ':'),
+        0x34 => ('\'', '"'),
+        0x35 => ('`', '~'),
+        0x36 => (',', '<'),
+        0x37 => ('.', '>'),
+        0x38 => ('/', '?'),
+        _ => return None,
+    };
+    Some(if shift { shifted } else { plain })
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
@@ -81,5 +128,15 @@ mod tests {
         assert_eq!(for_char(' '), Some((0x2c, false)));
         assert_eq!(for_char('\n'), Some((ENTER, false)));
         assert_eq!(for_char('é'), None);
+    }
+
+    #[test]
+    fn keys_type_back_the_characters_they_came_from() {
+        for c in "Hello, World! 123 ~_+{}|:\"<>? -=[]\\;'`,./".chars() {
+            let (code, shift) = for_char(c).unwrap();
+            assert_eq!(to_char(code, shift), Some(c), "{c:?}");
+        }
+        assert_eq!(to_char(ENTER, false), None);
+        assert!(is_shift(0xe5) && is_super(0xe3));
     }
 }

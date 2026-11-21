@@ -28,6 +28,12 @@ object Native {
     /** One USB HID key (page 0x07). */
     external fun nativeKey(code: Int, pressed: Boolean)
     external fun nativeText(text: String)
+
+    /** Whether computers may drive this phone, and its screen size. */
+    external fun nativeSetControllable(enabled: Boolean, width: Int, height: Int)
+
+    /** The next on-screen action while a computer drives the phone, or null. */
+    external fun nativeNextControl(timeoutMs: Int): String?
 }
 
 /** USB HID usages for the extra keys on the keyboard bar. */

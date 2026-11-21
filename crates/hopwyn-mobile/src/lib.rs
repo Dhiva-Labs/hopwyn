@@ -60,7 +60,95 @@ pub enum Command {
     /// Type this text, as a US keyboard would.
     Text(String),
     Forget(DeviceId),
+    /// Whether computers may drive this phone (its Accessibility service is
+    /// on), and its screen size in pixels.
+    SetControllable {
+        enabled: bool,
+        width: u32,
+        height: u32,
+    },
     Stop,
+}
+
+/// What the phone's Accessibility service must do while a computer drives
+/// the phone. Coordinates are screen pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Control {
+    /// Show the pointer here (a computer just took over).
+    Show {
+        x: f32,
+        y: f32,
+    },
+    Move {
+        x: f32,
+        y: f32,
+    },
+    /// Hide the pointer (control went back to the computer).
+    Hide,
+    Tap {
+        x: f32,
+        y: f32,
+    },
+    /// A drag: from, to, how long.
+    Swipe {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        ms: u32,
+    },
+    Back,
+    Home,
+    /// Type into the focused text field.
+    Text(String),
+    Enter,
+    Backspace,
+}
+
+impl Control {
+    /// One line for the app, like [`Event::to_line`].
+    pub fn to_line(&self) -> String {
+        let n = |v: f32| format!("{v:.1}");
+        match self {
+            Control::Show { x, y } => format!("show{UNIT}{}{UNIT}{}", n(*x), n(*y)),
+            Control::Move { x, y } => format!("move{UNIT}{}{UNIT}{}", n(*x), n(*y)),
+            Control::Hide => "hide".into(),
+            Control::Tap { x, y } => format!("tap{UNIT}{}{UNIT}{}", n(*x), n(*y)),
+            Control::Swipe { x1, y1, x2, y2, ms } => format!(
+                "swipe{UNIT}{}{UNIT}{}{UNIT}{}{UNIT}{}{UNIT}{ms}",
+                n(*x1),
+                n(*y1),
+                n(*x2),
+                n(*y2)
+            ),
+            Control::Back => "back".into(),
+            Control::Home => "home".into(),
+            Control::Text(t) => format!("text{UNIT}{}", clean(t)),
+            Control::Enter => "enter".into(),
+            Control::Backspace => "backspace".into(),
+        }
+    }
+}
+
+/// Phone pixels per computer pixel of pointer motion (phone screens are
+/// denser, so the pointer moves a little further).
+const DRIVEN_SPEED: f32 = 1.3;
+/// Phone pixels swiped per scrolled line.
+const SWIPE_PER_LINE: f32 = 90.0;
+/// How far a held click must move to be a drag rather than a tap.
+const DRAG_SLOP: f32 = 12.0;
+
+/// A computer driving this phone.
+#[derive(Debug, Clone, Copy)]
+struct Driven {
+    by: DeviceId,
+    /// The edge the pointer came in over; leaving over it goes back.
+    edge: Edge,
+    x: f32,
+    y: f32,
+    /// Where the left button went down, while it is held.
+    pressed_at: Option<(f32, f32)>,
+    shift: bool,
 }
 
 /// What the app hears.
@@ -168,6 +256,7 @@ impl Event {
 pub struct Mobile {
     cmd: mpsc::UnboundedSender<Command>,
     events: Mutex<std_mpsc::Receiver<Event>>,
+    controls: Mutex<std_mpsc::Receiver<Control>>,
 }
 
 /// Ports, overridable for tests (several cores on one machine).
@@ -193,6 +282,7 @@ impl Mobile {
         let identity = Arc::new(store.identity(name)?);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = std_mpsc::channel();
+        let (ctl_tx, ctl_rx) = std_mpsc::channel();
         let (ready_tx, ready_rx) = std_mpsc::channel();
         std::thread::Builder::new()
             .name("hopwyn-mobile".into())
@@ -205,7 +295,7 @@ impl Mobile {
                     }
                 };
                 rt.block_on(async move {
-                    match Core::new(store, identity, ports, ev_tx) {
+                    match Core::new(store, identity, ports, ev_tx, ctl_tx) {
                         Ok(core) => {
                             let _ = ready_tx.send(Ok(()));
                             core.run(cmd_rx).await;
@@ -221,6 +311,7 @@ impl Mobile {
         Ok(Self {
             cmd: cmd_tx,
             events: Mutex::new(ev_rx),
+            controls: Mutex::new(ctl_rx),
         })
     }
 
@@ -231,6 +322,12 @@ impl Mobile {
     /// The next event, waiting up to `timeout`.
     pub fn next_event(&self, timeout: Duration) -> Option<Event> {
         self.events.lock().ok()?.recv_timeout(timeout).ok()
+    }
+
+    /// The next thing to do on screen while a computer drives the phone
+    /// (for the Accessibility service), waiting up to `timeout`.
+    pub fn next_control(&self, timeout: Duration) -> Option<Control> {
+        self.controls.lock().ok()?.recv_timeout(timeout).ok()
     }
 }
 
@@ -318,6 +415,10 @@ struct Core {
     identity: Arc<Identity>,
     ports: Ports,
     events: std_mpsc::Sender<Event>,
+    controls: std_mpsc::Sender<Control>,
+    /// The screen size, while computers may drive this phone.
+    controllable: Option<(f32, f32)>,
+    driven: Option<Driven>,
     partners: Vec<(DeviceId, String)>,
     links: HashMap<DeviceId, Link>,
     connected: Arc<Mutex<HashSet<DeviceId>>>,
@@ -340,6 +441,7 @@ impl Core {
         identity: Arc<Identity>,
         ports: Ports,
         events: std_mpsc::Sender<Event>,
+        controls: std_mpsc::Sender<Control>,
     ) -> Result<Self, String> {
         let partners = store.partners();
         let trust = TrustStore::new();
@@ -480,6 +582,9 @@ impl Core {
             identity,
             ports,
             events,
+            controls,
+            controllable: None,
+            driven: None,
             partners,
             links: HashMap::new(),
             connected,
@@ -578,8 +683,9 @@ impl Core {
                     }
                     let _ = fwd.send(Internal::Gone(id, generation));
                 });
-                // Tell it we're a remote, so it keeps no screen edge for us.
-                self.send_to(id, &Message::Remote).await;
+                // Tell it what we are: a screen it can drive, or a remote.
+                let hello = self.hello();
+                self.send_to(id, &hello).await;
                 self.publish_partners();
             }
             Internal::Message(id, generation, m) => {
@@ -587,10 +693,10 @@ impl Core {
                     return;
                 }
                 match m {
-                    // A computer trying to drive the phone: not supported yet.
-                    Message::Enter { .. } => {
-                        self.send_to(id, &Message::Leave).await;
+                    Message::Enter { edge, position } => {
+                        self.driven_enter(id, edge, position).await
                     }
+                    _ if self.driven.is_some_and(|d| d.by == id) => self.driven_input(m).await,
                     // It took its own mouse back (its panic key, or it gave up).
                     Message::Leave | Message::LeaveAt { .. } if self.controlling == Some(id) => {
                         self.controlling = None;
@@ -600,6 +706,10 @@ impl Core {
                 }
             }
             Internal::Gone(id, generation) => {
+                if self.driven.is_some_and(|d| d.by == id) {
+                    self.driven = None;
+                    self.control(Control::Hide);
+                }
                 if self.links.get(&id).map(|l| l.generation) == Some(generation) {
                     self.links.remove(&id);
                     if let Ok(mut c) = self.connected.lock() {
@@ -768,8 +878,177 @@ impl Core {
                 self.publish_partners();
                 self.publish_nearby();
             }
+            Command::SetControllable {
+                enabled,
+                width,
+                height,
+            } => {
+                #[allow(clippy::cast_precision_loss)]
+                let size =
+                    (enabled && width > 0 && height > 0).then_some((width as f32, height as f32));
+                if size == self.controllable {
+                    return;
+                }
+                self.controllable = size;
+                if size.is_none()
+                    && let Some(d) = self.driven.take()
+                {
+                    self.control(Control::Hide);
+                    self.send_to(d.by, &Message::Leave).await;
+                }
+                let hello = self.hello();
+                let ids: Vec<DeviceId> = self.links.keys().copied().collect();
+                for id in ids {
+                    self.send_to(id, &hello).await;
+                }
+            }
             Command::Stop => {}
         }
+    }
+
+    fn control(&self, c: Control) {
+        let _ = self.controls.send(c);
+    }
+
+    /// What computers are told about this phone: its screen (they may drive
+    /// it), or that it's only a remote.
+    fn hello(&self) -> Message {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        match self.controllable {
+            Some((w, h)) => Message::Screen {
+                width: w as u32,
+                height: h as u32,
+            },
+            None => Message::Remote,
+        }
+    }
+
+    /// A computer's pointer came over to this phone across `edge`, at
+    /// `position` along it.
+    async fn driven_enter(&mut self, by: DeviceId, edge: Edge, position: f32) {
+        let Some((w, h)) = self.controllable else {
+            // Not allowed to be driven (Accessibility service off).
+            self.send_to(by, &Message::Leave).await;
+            return;
+        };
+        if self.controlling.is_some() {
+            // We're driving a computer ourselves.
+            self.send_to(by, &Message::Leave).await;
+            return;
+        }
+        let p = position.clamp(0.0, 1.0);
+        let inset = 4.0;
+        let (x, y) = match edge {
+            Edge::Left => (inset, p * h),
+            Edge::Right => (w - inset, p * h),
+            Edge::Top => (p * w, inset),
+            Edge::Bottom => (p * w, h - inset),
+        };
+        self.driven = Some(Driven {
+            by,
+            edge,
+            x,
+            y,
+            pressed_at: None,
+            shift: false,
+        });
+        self.control(Control::Show { x, y });
+    }
+
+    /// Input from the computer driving this phone.
+    async fn driven_input(&mut self, m: Message) {
+        let (Some(mut d), Some((w, h))) = (self.driven, self.controllable) else {
+            return;
+        };
+        match m {
+            Message::PointerMotion { dx, dy } => {
+                #[allow(clippy::cast_precision_loss)]
+                let (nx, ny) = (
+                    d.x + dx as f32 * DRIVEN_SPEED,
+                    d.y + dy as f32 * DRIVEN_SPEED,
+                );
+                // Back over the edge it came in by: control goes back.
+                let (out, along) = match d.edge {
+                    Edge::Left => (nx < 0.0, ny / h),
+                    Edge::Right => (nx > w, ny / h),
+                    Edge::Top => (ny < 0.0, nx / w),
+                    Edge::Bottom => (ny > h, nx / w),
+                };
+                if out && d.pressed_at.is_none() {
+                    self.driven = None;
+                    self.control(Control::Hide);
+                    self.send_to(
+                        d.by,
+                        &Message::LeaveAt {
+                            position: along.clamp(0.0, 1.0),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                d.x = nx.clamp(0.0, w - 1.0);
+                d.y = ny.clamp(0.0, h - 1.0);
+                self.control(Control::Move { x: d.x, y: d.y });
+            }
+            Message::PointerButton { button, pressed } => match (button, pressed) {
+                (Button::Left, true) => d.pressed_at = Some((d.x, d.y)),
+                (Button::Left, false) => {
+                    if let Some((x0, y0)) = d.pressed_at.take() {
+                        if (d.x - x0).hypot(d.y - y0) > DRAG_SLOP {
+                            self.control(Control::Swipe {
+                                x1: x0,
+                                y1: y0,
+                                x2: d.x,
+                                y2: d.y,
+                                ms: 350,
+                            });
+                        } else {
+                            self.control(Control::Tap { x: d.x, y: d.y });
+                        }
+                    }
+                }
+                (Button::Right | Button::Back, true) => self.control(Control::Back),
+                (Button::Middle, true) => self.control(Control::Home),
+                _ => {}
+            },
+            Message::Scroll { dy, .. } if dy.is_finite() && dy != 0.0 => {
+                // Scrolling down moves the content up: swipe upwards.
+                let dist = (dy * SWIPE_PER_LINE).clamp(-h * 0.6, h * 0.6);
+                let y2 = (d.y - dist).clamp(1.0, h - 1.0);
+                self.control(Control::Swipe {
+                    x1: d.x,
+                    y1: d.y,
+                    x2: d.x,
+                    y2,
+                    ms: 120,
+                });
+            }
+            Message::Key { code, pressed } => {
+                if keys::is_shift(code) {
+                    d.shift = pressed;
+                } else if pressed {
+                    match code {
+                        keys::ENTER => self.control(Control::Enter),
+                        keys::BACKSPACE => self.control(Control::Backspace),
+                        keys::ESCAPE => self.control(Control::Back),
+                        c if keys::is_super(c) => self.control(Control::Home),
+                        c => {
+                            if let Some(ch) = keys::to_char(c, d.shift) {
+                                self.control(Control::Text(ch.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            // The computer took its own mouse back (its panic key).
+            Message::Leave | Message::LeaveAt { .. } => {
+                self.driven = None;
+                self.control(Control::Hide);
+                return;
+            }
+            _ => {}
+        }
+        self.driven = Some(d);
     }
 
     /// Sends input to the computer being driven, if any.

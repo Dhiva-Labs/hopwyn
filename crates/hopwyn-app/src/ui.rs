@@ -543,6 +543,10 @@ impl Ui {
             }
             UiEvent::PeerScreen { id, size } => {
                 self.peer_sizes.borrow_mut().insert(id, size);
+                // It has a screen to drive: not just a remote any more.
+                if self.remotes.borrow_mut().remove(&id) {
+                    self.refresh_partners();
+                }
                 self.canvas.queue_draw();
             }
 

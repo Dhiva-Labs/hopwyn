@@ -15,6 +15,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** This phone's name as computers see it. */
+fun deviceName(context: Context): String =
+    Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
+        ?.takeIf { it.isNotBlank() }
+        ?: Build.MODEL
+
 data class Computer(val id: String, val name: String, val online: Boolean)
 
 data class NearbyComputer(val id: String, val name: String, val paired: Boolean, val open: Boolean)
@@ -45,6 +51,9 @@ class HopwynModel(app: Application) : AndroidViewModel(app) {
     var message by mutableStateOf<String?>(null)
     var startError by mutableStateOf<String?>(null)
         private set
+    /** Whether computers can drive this phone (the Accessibility service is on). */
+    var controllable by mutableStateOf(ControlService.active)
+        private set
 
     // mDNS needs multicast packets, which Android drops unless asked.
     private val multicast = (app.getSystemService(Context.WIFI_SERVICE) as WifiManager)
@@ -53,9 +62,7 @@ class HopwynModel(app: Application) : AndroidViewModel(app) {
 
     init {
         multicast.acquire()
-        val name = Settings.Global.getString(app.contentResolver, Settings.Global.DEVICE_NAME)
-            ?.takeIf { it.isNotBlank() }
-            ?: Build.MODEL
+        val name = deviceName(app)
         viewModelScope.launch {
             val error = withContext(Dispatchers.IO) {
                 Native.nativeStart(app.filesDir.absolutePath, name)
@@ -65,8 +72,9 @@ class HopwynModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             while (isActive) {
-                val line = withContext(Dispatchers.IO) { Native.nativeNextEvent(250) } ?: continue
-                handle(line)
+                val line = withContext(Dispatchers.IO) { Native.nativeNextEvent(250) }
+                controllable = ControlService.active
+                if (line != null) handle(line)
             }
         }
     }

@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">Hopwyn</string>
+    <string name="accessibility_summary">Lets your paired computer\'s mouse and keyboard control this phone</string>
+    <string name="accessibility_description">When you move your computer\'s pointer off the edge where this phone sits, Hopwyn shows a pointer here and turns clicks into taps, drags into swipes, the scroll wheel into scrolling, and typing into text. It works only with computers you paired, over your home network, encrypted. Hopwyn does not read what is on your screen, except to find the text field you type into.</string>
 </resources>

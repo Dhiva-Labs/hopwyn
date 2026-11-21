@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The pointer shown while a computer drives the phone: a white arrow
+     with a dark outline, its tip at the top-left corner. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="28dp" android:height="28dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFF" android:strokeColor="#1A1A1A" android:strokeWidth="1.4"
+        android:strokeLineJoin="round"
+        android:pathData="M1.5,1.5 L1.5,19 L6,14.8 L9.2,21.6 L12.4,20.1 L9.3,13.5 L15.6,13.5 Z" />
+</vector>
