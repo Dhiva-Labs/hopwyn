@@ -349,6 +349,9 @@ struct Peer {
     remote: bool,
     /// Debug only: pointer motion received since the last other message.
     motion_seen: (i64, i64, u32),
+    /// When the current link came up (a phone says it's a remote just
+    /// after connecting, so it isn't counted as a computer until then).
+    linked_at: Option<Instant>,
 }
 
 struct Service {
@@ -533,6 +536,7 @@ impl Service {
                 return_at: None,
                 remote: false,
                 motion_seen: (0, 0, 0),
+                linked_at: None,
             })
             .collect();
         Ok(Self {
@@ -602,6 +606,7 @@ impl Service {
                     for i in 0..self.peers.len() {
                         self.step(i, Input::Tick).await;
                     }
+                    self.want_input();
                 }
                 cmd = cmds.recv() => match cmd {
                     None | Some(Command::Quit) => break,
@@ -735,6 +740,7 @@ impl Service {
                         old.close();
                     }
                     peer.generation = generation;
+                    peer.linked_at = Some(Instant::now());
                 }
                 let fwd = self.tx.clone();
                 tokio::spawn(async move {
@@ -751,7 +757,6 @@ impl Service {
                 }
                 let moved = self.resolve_side_conflict(i);
                 self.update_edges();
-                self.want_input();
                 self.step(i, Input::PeerConnected).await;
                 // One side's arrangement wins on connect (the lower key), so
                 // a pair can never disagree about which edges face.
@@ -1114,7 +1119,14 @@ impl Service {
     /// being asked for, and it's time: at startup, or once a paired
     /// computer is online, as the user chose.
     fn want_input(&mut self) {
-        let online = self.peers.iter().any(|p| p.sender.is_some());
+        // A computer, not a phone remote (which needs no screen edges), that
+        // has been linked long enough to have said which it is.
+        let online = self.peers.iter().any(|p| {
+            p.sender.is_some()
+                && !p.remote
+                && p.linked_at
+                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(1))
+        });
         if self.input == InputState::Waiting && (self.settings.ask == AskWhen::Startup || online) {
             self.want_input_now();
         }
@@ -1481,6 +1493,7 @@ impl Service {
             return_at: None,
             remote: false,
             motion_seen: (0, 0, 0),
+            linked_at: None,
         });
         self.partners_changed();
         self.send_ui(UiEvent::PairingDone(peer.name));
