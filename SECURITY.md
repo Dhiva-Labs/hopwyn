@@ -16,10 +16,10 @@ Please do not open a public issue. Use GitHub's private vulnerability reporting 
 - **Discovery is untrusted.** mDNS announcements are only hints for where to connect; identity is proven by the pinned-key handshake. Announcements are validated (version, key format, name characters, home addresses only) and capped at 64 devices. Each device's name and public key are visible to others on the home network.
 - **Visible control and a way out:** the app shows when this computer is controlling, or controlled by, the other one, and Ctrl+Alt+Esc always returns the cursor.
 - **Planned before v1.0, not built yet:** separate network and input-injection processes (least privilege), and refusing injected input on a locked screen.
-- **Hostile-input parsing:** the protocol decoder bounds every length, rejects non-finite floats and trailing bytes, and is fuzzed.
+- **Hostile-input parsing:** the protocol decoder bounds every length, rejects non-finite floats and trailing bytes, and has a cargo-fuzz target that checks decoding round-trips.
 
 ## Supply chain
 
 - `unsafe` code is forbidden outside OS bindings.
-- Every build runs `cargo audit` and `cargo deny`.
-- Releases are signed, built reproducibly, and ship with an SBOM.
+- CI runs `cargo audit` against the RustSec advisory database on every pull request and every push to `main`.
+- **Planned before v1.0, not built yet:** `cargo deny` checks for licences and crate sources, signed and reproducible release builds, and an SBOM with each release.
