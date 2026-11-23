@@ -20,6 +20,7 @@ fn main() {
     let ports = Ports {
         link: 4292,
         pairing: 4293,
+        computer: false,
     };
     let m = match Mobile::start(dir, "Test Phone", ports) {
         Ok(m) => m,
@@ -47,7 +48,7 @@ fn main() {
                     hosting = true;
                     m.send(Command::AddComputer);
                 }
-                target = list.into_iter().find(|(_, _, up)| *up).map(|(id, _, _)| id);
+                target = list.into_iter().find(|p| p.2).map(|p| p.0);
             }
             _ => {}
         }

@@ -41,6 +41,7 @@ fn main() {
         Ports {
             link: 4322,
             pairing: 4323,
+            computer: true,
         },
     ) else {
         std::process::exit(1);

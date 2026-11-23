@@ -1,6 +1,6 @@
 # Hopwyn privacy policy
 
-_Last updated: 21 November 2026_
+_Last updated: 24 November 2026_
 
 Hopwyn lets the computers and phones in your home share one mouse and keyboard. This policy covers the Hopwyn apps for Android, Linux, Windows and macOS, published by Dhiva Labs.
 
@@ -10,7 +10,7 @@ Hopwyn collects no personal data. It has no account, no cloud service, no analyt
 
 ## What stays on your devices
 
-- **Device keys and pairings.** Each device creates its own encryption key on first launch. When you pair two devices, each stores the other's public key and name so they can recognise each other later. These stay on your devices; Hopwyn never uploads them.
+- **Device keys and pairings.** Each device creates its own encryption key on first launch. When you pair two devices, each stores the other's public key and name so they can recognise each other later. Each also remembers the local network address where it last reached the other, so they can reconnect on networks that hide devices from each other. These stay on your devices; Hopwyn never uploads them.
 - **Settings.** Your choices, such as theme and pointer speed, are saved on the device.
 - **Device name.** Hopwyn announces your device's name (for example "Pixel 9") on your local network so your other devices can list it. It is visible only to devices on the same network.
 

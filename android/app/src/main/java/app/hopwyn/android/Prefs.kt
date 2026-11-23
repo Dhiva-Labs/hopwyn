@@ -31,6 +31,12 @@ class Prefs(context: Context) {
     /** Whether the user has read and agreed to what phone control can do. */
     var controlDisclosed by mutableStateOf(store.getBoolean(DISCLOSED, false))
         private set
+    /**
+     * Whether phone control was on when last seen. If it's off now, Android
+     * (or the user) turned it off, and the home screen says so.
+     */
+    var controlWasOn by mutableStateOf(store.getBoolean(WAS_ON, false))
+        private set
 
     fun updateTheme(mode: ThemeMode) {
         theme = mode
@@ -57,6 +63,12 @@ class Prefs(context: Context) {
         store.edit().putBoolean(DISCLOSED, true).apply()
     }
 
+    fun noteControl(on: Boolean) {
+        if (controlWasOn == on) return
+        controlWasOn = on
+        store.edit().putBoolean(WAS_ON, on).apply()
+    }
+
     companion object {
         const val DEFAULT_SPEED = 1.6f
         private const val THEME = "theme"
@@ -64,6 +76,7 @@ class Prefs(context: Context) {
         private const val SPEED = "pointer_speed"
         private const val NATURAL = "natural_scroll"
         private const val DISCLOSED = "control_disclosed"
+        private const val WAS_ON = "control_was_on"
 
         @Volatile private var instance: Prefs? = null
 

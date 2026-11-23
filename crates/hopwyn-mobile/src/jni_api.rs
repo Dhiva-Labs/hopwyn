@@ -102,6 +102,34 @@ pub extern "system" fn Java_app_hopwyn_android_Native_nativeConfirm<'l>(
     send(Command::Confirm(yes != 0));
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_hopwyn_android_Native_nativeJoinAddress<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    address: JString<'l>,
+) {
+    send(Command::JoinAddress(string(&mut env, &address)));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_hopwyn_android_Native_nativeSetAddress<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    id: JString<'l>,
+    address: JString<'l>,
+) {
+    let address = string(&mut env, &address);
+    with_id(&mut env, &id, |id| Command::SetAddress(id, address));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_hopwyn_android_Native_nativeNetworkChanged<'l>(
+    _env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) {
+    send(Command::NetworkChanged);
+}
+
 fn with_id(
     env: &mut JNIEnv<'_>,
     id: &JString<'_>,

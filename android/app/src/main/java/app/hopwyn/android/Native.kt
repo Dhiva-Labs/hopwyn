@@ -16,6 +16,15 @@ object Native {
     external fun nativeCancelPairing()
     external fun nativeConfirm(yes: Boolean)
     external fun nativeJoin(id: String)
+
+    /** Joins the pairing window of the computer at this typed address. */
+    external fun nativeJoinAddress(address: String)
+
+    /** Where to look for a paired computer that isn't found on its own. */
+    external fun nativeSetAddress(id: String, address: String)
+
+    /** The phone joined, left or changed network. */
+    external fun nativeNetworkChanged()
     external fun nativeControl(id: String)
     external fun nativeRelease()
     external fun nativeForget(id: String)

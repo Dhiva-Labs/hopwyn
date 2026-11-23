@@ -23,6 +23,8 @@ pub struct DiscoveredDevice {
     pub pairing: Option<String>,
     /// The TCP port it pairs on, if it announced one.
     pub pairing_port: Option<u16>,
+    /// It says it is a phone: a remote, not a computer to control.
+    pub phone: bool,
 }
 
 /// Accepts a pairing token of 1 to 16 lowercase hex digits.
@@ -128,6 +130,7 @@ pub(crate) fn validate(
         addrs,
         pairing: None,
         pairing_port: None,
+        phone: false,
     })
 }
 

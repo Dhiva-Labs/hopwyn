@@ -26,6 +26,8 @@ pub use parse::{DiscoveredDevice, MAX_TRACKED, instance_name};
 pub const SERVICE_TYPE: &str = "_hopwyn._udp.local.";
 /// TXT record format version.
 pub const TXT_VERSION: &str = "1";
+/// TXT `kind` value a phone announces. Computers announce none.
+const KIND_PHONE: &str = "phone";
 
 /// A change in the set of devices seen on the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,24 @@ impl Discovery {
         identity: &Identity,
         port: u16,
     ) -> Result<(Self, mpsc::Receiver<DiscoveryEvent>), DiscoveryError> {
+        Self::start_as(identity, port, false)
+    }
+
+    /// Like [`Discovery::start`], for a phone: other devices see
+    /// [`DiscoveredDevice::phone`] set, so phones don't list each other as
+    /// computers.
+    pub fn start_phone(
+        identity: &Identity,
+        port: u16,
+    ) -> Result<(Self, mpsc::Receiver<DiscoveryEvent>), DiscoveryError> {
+        Self::start_as(identity, port, true)
+    }
+
+    fn start_as(
+        identity: &Identity,
+        port: u16,
+        phone: bool,
+    ) -> Result<(Self, mpsc::Receiver<DiscoveryEvent>), DiscoveryError> {
         let daemon = ServiceDaemon::new().map_err(err)?;
         let self_id = identity.id();
 
@@ -84,6 +104,9 @@ impl Discovery {
         txt.insert("v".to_owned(), TXT_VERSION.to_owned());
         txt.insert("id".to_owned(), id_hex.clone());
         txt.insert("name".to_owned(), identity.name().to_owned());
+        if phone {
+            txt.insert("kind".to_owned(), KIND_PHONE.to_owned());
+        }
 
         let info = ServiceInfo::new(SERVICE_TYPE, &instance, &host, (), port, txt)
             .map_err(err)?
@@ -211,7 +234,8 @@ fn pump(
                     &addrs,
                     self_id,
                 );
-                match device {
+                let phone = svc.get_property_val_str("kind") == Some(KIND_PHONE);
+                match device.map(|d| DiscoveredDevice { phone, ..d }) {
                     Some(d)
                         if devices.contains_key(&svc.fullname) || devices.len() < MAX_TRACKED =>
                     {

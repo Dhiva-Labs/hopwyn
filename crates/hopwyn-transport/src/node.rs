@@ -317,14 +317,14 @@ async fn write_frame(send: &mut SendStream, msg: &Message) -> Result<(), Transpo
     frame.extend_from_slice(&body);
     send.write_all(&frame)
         .await
-        .map_err(|e| TransportError::Connection(e.to_string()))
+        .map_err(|e| TransportError::Connection(with_cause(&e)))
 }
 
 async fn read_frame(recv: &mut RecvStream) -> Result<Message, TransportError> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len)
         .await
-        .map_err(|e| TransportError::Connection(e.to_string()))?;
+        .map_err(|e| TransportError::Connection(with_cause(&e)))?;
     let len = usize::try_from(u32::from_le_bytes(len)).unwrap_or(usize::MAX);
     if len > MAX_FRAME {
         return Err(TransportError::FrameTooLarge(len));
@@ -332,6 +332,18 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Message, TransportError> {
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body)
         .await
-        .map_err(|e| TransportError::Connection(e.to_string()))?;
+        .map_err(|e| TransportError::Connection(with_cause(&e)))?;
     Ok(Message::decode(&body)?)
+}
+
+/// An error with what caused it: "connection lost: closed by peer".
+fn with_cause(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    text
 }

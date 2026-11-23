@@ -18,23 +18,43 @@ pub mod keys;
 mod pairing_net;
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hopwyn_discovery::{Discovery, DiscoveryEvent};
 use hopwyn_pair::{DeviceId, Identity, PairedPeer};
 use hopwyn_proto::{Button, DecodeError, Edge, Message};
-use hopwyn_transport::{Node, PeerConnection, PeerSender, TransportError, TrustStore};
+use hopwyn_transport::{
+    Node, PeerConnection, PeerSender, TransportError, TrustStore, is_home_address,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::pairing_net::{PAIRING_PORT, PAIRING_WINDOW, PairNetError};
 
 pub const LINK_PORT: u16 = 4242;
+/// The first wait between attempts to reach a paired computer. It doubles
+/// while every attempt fails, up to [`RETRY_MAX`], so a phone whose
+/// computers are switched off stays quiet.
 const RETRY: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+/// With every paired computer linked, the dial loop only wakes for changes.
+const SETTLED: Duration = Duration::from_secs(300);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(4);
+/// Normally the device with the higher key dials. The other one starts
+/// dialing too after this long without a link, for networks where only one
+/// side knows the other's address.
+const FALLBACK: Duration = Duration::from_secs(6);
+/// A link dropped this soon was refused rather than lost.
+const DROPPED_WITHIN: Duration = Duration::from_secs(1);
+/// This many refusals in a row and the user is told.
+const DROPS_TO_TELL: u8 = 3;
+/// How often to try a computer that keeps refusing.
+const DROPPING_RETRY: Duration = Duration::from_secs(300);
+/// Addresses remembered per computer, newest first.
+const MAX_KNOWN: usize = 4;
 
 /// What the app asks for.
 #[derive(Debug, Clone)]
@@ -46,6 +66,13 @@ pub enum Command {
     Confirm(bool),
     /// Join a nearby computer's open pairing window.
     Join(DeviceId),
+    /// Join the pairing window of the computer at this address, typed by
+    /// the user because the computer doesn't show up on its own.
+    JoinAddress(String),
+    /// Where to reach a paired computer that isn't found on its own.
+    SetAddress(DeviceId, String),
+    /// The phone joined, left or changed network.
+    NetworkChanged,
     /// Start driving this paired computer.
     Control(DeviceId),
     /// Stop driving; the computer gets its own mouse back.
@@ -158,8 +185,10 @@ pub enum Event {
         name: String,
         id: String,
     },
-    /// Paired computers: id, name, connected.
-    Partners(Vec<(DeviceId, String, bool)>),
+    /// Paired computers: id, name, connected, seen on this network, the
+    /// address last used to reach it (or empty), and whether it keeps
+    /// dropping the link (it has most likely forgotten this phone).
+    Partners(Vec<(DeviceId, String, bool, bool, String, bool)>),
     /// Nearby computers: id, name, paired, pairing window open.
     Nearby(Vec<(DeviceId, String, bool, bool)>),
     PairingOpen,
@@ -213,8 +242,16 @@ impl Event {
             Event::Partners(list) => {
                 let recs: Vec<String> = list
                     .iter()
-                    .map(|(id, name, up)| {
-                        format!("{}{FIELD}{}{FIELD}{}", hex(id), clean(name), b(*up))
+                    .map(|(id, name, up, seen, addr, dropping)| {
+                        format!(
+                            "{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}{FIELD}{}",
+                            hex(id),
+                            clean(name),
+                            b(*up),
+                            b(*seen),
+                            clean(addr),
+                            b(*dropping)
+                        )
                     })
                     .collect();
                 format!("partners{UNIT}{}", recs.join(&RECORD.to_string()))
@@ -264,6 +301,9 @@ pub struct Mobile {
 pub struct Ports {
     pub link: u16,
     pub pairing: u16,
+    /// Stand in for a computer (tests and demos): announce as one, and
+    /// treat phones as devices to pair with.
+    pub computer: bool,
 }
 
 impl Default for Ports {
@@ -271,6 +311,7 @@ impl Default for Ports {
         Self {
             link: LINK_PORT,
             pairing: PAIRING_PORT,
+            computer: false,
         }
     }
 }
@@ -376,27 +417,199 @@ impl Store {
             .collect();
         let _ = std::fs::write(self.dir.join("partners"), text);
     }
+
+    /// Where each paired computer was last reached, newest first.
+    fn addresses(&self) -> HashMap<DeviceId, Vec<SocketAddr>> {
+        let text = std::fs::read_to_string(self.dir.join("addresses")).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| {
+                let mut parts = l.split(' ');
+                let id = parse_id(parts.next()?)?;
+                let addrs: Vec<SocketAddr> = parts
+                    .filter_map(|a| a.parse().ok())
+                    .filter(|a: &SocketAddr| is_home_address(a.ip()))
+                    .take(MAX_KNOWN)
+                    .collect();
+                (!addrs.is_empty()).then_some((id, addrs))
+            })
+            .collect()
+    }
+
+    fn save_addresses(&self, map: &HashMap<DeviceId, Vec<SocketAddr>>) {
+        let text: String = map
+            .iter()
+            .map(|(id, addrs)| {
+                let list: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+                format!("{} {}\n", hex(id), list.join(" "))
+            })
+            .collect();
+        let _ = std::fs::write(self.dir.join("addresses"), text);
+    }
 }
 
-#[derive(Debug, Clone)]
+/// Reads what the user typed for a computer's address: an IPv4 address,
+/// with or without a port. Only home-network addresses are accepted.
+pub fn parse_address(text: &str, default_port: u16) -> Result<SocketAddr, String> {
+    let t = text.trim();
+    let addr = match t.parse::<SocketAddr>() {
+        Ok(a) => a,
+        Err(_) => SocketAddr::new(
+            t.parse::<IpAddr>()
+                .map_err(|_| "that isn't an address. It looks like 192.168.1.20".to_owned())?,
+            default_port,
+        ),
+    };
+    if !is_home_address(addr.ip()) {
+        return Err("Hopwyn only connects to addresses on your own network".into());
+    }
+    Ok(addr)
+}
+
+/// What the dial loop and the core both need to know about reaching
+/// paired computers.
+#[derive(Default)]
+struct Reach {
+    /// Addresses announced on this network.
+    found: HashMap<DeviceId, Vec<SocketAddr>>,
+    /// Addresses that worked before, or that the user typed.
+    known: HashMap<DeviceId, Vec<SocketAddr>>,
+    connected: HashSet<DeviceId>,
+    /// Computers that drop every link at once, tried only now and then.
+    dropping: HashSet<DeviceId>,
+    /// When each computer was last linked (or the core started).
+    unlinked: HashMap<DeviceId, Instant>,
+}
+
+impl Reach {
+    /// The addresses to try for `id`, or none if it's linked or not yet
+    /// this side's turn to dial.
+    fn candidates(&self, id: &DeviceId, higher: bool, started: Instant) -> Vec<SocketAddr> {
+        if self.connected.contains(id) {
+            return Vec::new();
+        }
+        let waited = self.unlinked.get(id).copied().unwrap_or(started).elapsed();
+        if !higher && waited < FALLBACK {
+            return Vec::new();
+        }
+        let mut out: Vec<SocketAddr> = Vec::new();
+        for a in self
+            .found
+            .get(id)
+            .into_iter()
+            .chain(self.known.get(id))
+            .flatten()
+        {
+            if !out.contains(a) {
+                out.push(*a);
+            }
+        }
+        out
+    }
+
+    fn remember(&mut self, id: DeviceId, addr: SocketAddr) -> bool {
+        let list = self.known.entry(id).or_default();
+        if list.first() == Some(&addr) {
+            return false;
+        }
+        list.retain(|a| *a != addr);
+        list.insert(0, addr);
+        list.truncate(MAX_KNOWN);
+        true
+    }
+}
+
+/// Paces redialing one computer. A link normally lasts, and when it drops
+/// it is redialed after a short gap. One that dies soon after coming up
+/// (the other end refuses it, say) would otherwise be redialed in a tight
+/// loop, so the gap doubles each time that happens.
+struct Pace {
+    dialed_at: Instant,
+    gap: Duration,
+    /// Whether the last link's lifetime has been counted.
+    judged: bool,
+}
+
+impl Pace {
+    /// A link that lasted this long was a real one.
+    const LASTED: Duration = Duration::from_secs(20);
+
+    fn new() -> Self {
+        Self {
+            dialed_at: Instant::now(),
+            gap: RETRY,
+            judged: true,
+        }
+    }
+
+    /// A dial just succeeded.
+    fn dialed(&mut self) {
+        self.dialed_at = Instant::now();
+        self.judged = false;
+    }
+
+    /// The link is down: how long to wait before dialing again, if at all.
+    /// `rarely`: it drops every link, so only check now and then whether
+    /// it has been paired again.
+    fn wait(&mut self, rarely: bool) -> Option<Duration> {
+        let lived = self.dialed_at.elapsed();
+        if rarely {
+            self.judged = true;
+            let left = DROPPING_RETRY.saturating_sub(lived);
+            return (!left.is_zero()).then_some(left);
+        }
+        if !self.judged {
+            self.judged = true;
+            self.gap = if lived < Self::LASTED {
+                (self.gap * 2).min(RETRY_MAX)
+            } else {
+                RETRY
+            };
+        }
+        let left = self.gap.saturating_sub(lived);
+        (!left.is_zero()).then_some(left)
+    }
+}
+
+/// Two links to one computer can come up at once when both sides dial.
+/// Both sides keep the one dialed by the higher key, so they agree.
+/// Returns whether the new link should replace the old one.
+fn replaces(me_higher: bool, old_dialed: bool, new_dialed: bool) -> bool {
+    !(old_dialed == me_higher && new_dialed != me_higher)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Seen {
     name: String,
     addrs: Vec<SocketAddr>,
     pairing: Option<String>,
     pairing_port: u16,
+    phone: bool,
 }
 
 struct Pairing {
     task: tokio::task::JoinHandle<()>,
     answer: Option<oneshot::Sender<bool>>,
     auto: bool,
+    /// The address the user typed, kept for linking once paired.
+    typed: Option<IpAddr>,
+}
+
+/// A new link: who, whether this side dialed it, and the other end's
+/// address.
+struct NewLink {
+    id: DeviceId,
+    dialed: bool,
+    addr: SocketAddr,
+    sender: PeerSender,
+    rx: mpsc::UnboundedReceiver<Message>,
 }
 
 enum Internal {
-    Connected(DeviceId, PeerSender, mpsc::UnboundedReceiver<Message>),
+    Connected(NewLink),
     Message(DeviceId, u64, Message),
     Gone(DeviceId, u64),
-    Nearby(HashMap<DeviceId, Seen>),
+    /// What discovery sees, tagged with which discovery run saw it.
+    Nearby(u64, HashMap<DeviceId, Seen>),
     Compare {
         name: String,
         code: String,
@@ -408,6 +621,8 @@ enum Internal {
 struct Link {
     sender: PeerSender,
     generation: u64,
+    dialed: bool,
+    since: Instant,
 }
 
 struct Core {
@@ -421,7 +636,13 @@ struct Core {
     driven: Option<Driven>,
     partners: Vec<(DeviceId, String)>,
     links: HashMap<DeviceId, Link>,
-    connected: Arc<Mutex<HashSet<DeviceId>>>,
+    /// Links in a row that each computer dropped at once without a word.
+    dropped: HashMap<DeviceId, u8>,
+    reach: Arc<Mutex<Reach>>,
+    /// Wakes the dial loop to try again now.
+    redial: Arc<tokio::sync::Notify>,
+    /// Counts discovery restarts, so a stopped run's last words are ignored.
+    discovery_run: u64,
     partners_tx: tokio::sync::watch::Sender<Vec<DeviceId>>,
     trust: TrustStore,
     discovery: Discovery,
@@ -456,52 +677,16 @@ impl Core {
             )
             .map_err(|e| format!("could not open UDP port {}: {e}", ports.link))?,
         );
-        let (discovery, found) =
-            Discovery::start(&identity, ports.link).map_err(|e| e.to_string())?;
+        let (discovery, found) = discover(&identity, ports).map_err(|e| e.to_string())?;
         let (tx, rx) = mpsc::unbounded_channel();
         let (partners_tx, partners_rx) =
             tokio::sync::watch::channel(partners.iter().map(|(id, _)| *id).collect::<Vec<_>>());
-        let addresses: Arc<Mutex<HashMap<DeviceId, Vec<SocketAddr>>>> = Arc::default();
-        let connected: Arc<Mutex<HashSet<DeviceId>>> = Arc::default();
-
-        // Discovery.
-        let disc_tx = tx.clone();
-        let disc_addrs = addresses.clone();
-        std::thread::spawn(move || {
-            let mut seen: HashMap<DeviceId, Seen> = HashMap::new();
-            while let Ok(ev) = found.recv() {
-                match ev {
-                    DiscoveryEvent::Found(d) => {
-                        let v4: Vec<SocketAddr> = d
-                            .addrs
-                            .iter()
-                            .copied()
-                            .filter(SocketAddr::is_ipv4)
-                            .collect();
-                        if !v4.is_empty() {
-                            if let Ok(mut m) = disc_addrs.lock() {
-                                m.insert(d.id, v4.clone());
-                            }
-                            seen.insert(
-                                d.id,
-                                Seen {
-                                    name: d.name,
-                                    addrs: v4,
-                                    pairing: d.pairing,
-                                    pairing_port: d.pairing_port.unwrap_or(PAIRING_PORT),
-                                },
-                            );
-                        }
-                    }
-                    DiscoveryEvent::Lost(id) => {
-                        seen.remove(&id);
-                    }
-                }
-                if disc_tx.send(Internal::Nearby(seen.clone())).is_err() {
-                    return;
-                }
-            }
-        });
+        let reach = Arc::new(Mutex::new(Reach {
+            known: store.addresses(),
+            ..Reach::default()
+        }));
+        let redial = Arc::new(tokio::sync::Notify::new());
+        watch_discovery(found, 0, tx.clone());
 
         // Incoming links from paired computers.
         let acc_tx = tx.clone();
@@ -511,7 +696,7 @@ impl Core {
             while let Some(r) = acc_node.accept().await {
                 match r {
                     Ok(conn) if acc_partners.borrow().contains(&conn.peer()) => {
-                        if hand_over(conn, &acc_tx).is_err() {
+                        if hand_over(conn, false, &acc_tx).is_err() {
                             return;
                         }
                     }
@@ -521,32 +706,41 @@ impl Core {
             }
         });
 
-        // Outgoing links: the higher key dials.
+        // Outgoing links. The higher key dials at once; the lower one
+        // joins in after FALLBACK without a link.
         let dial_tx = tx.clone();
         let me = identity.id();
         let mut dial_partners = partners_rx;
-        let dial_connected = connected.clone();
+        let dial_reach = reach.clone();
+        let dial_wake = redial.clone();
         tokio::spawn(async move {
+            let started = Instant::now();
+            let mut wait = RETRY;
+            let mut pace: HashMap<DeviceId, Pace> = HashMap::new();
             loop {
-                let targets: Vec<DeviceId> = dial_partners
-                    .borrow()
-                    .iter()
-                    .copied()
-                    .filter(|id| me.as_bytes() > id.as_bytes())
-                    .collect();
+                let targets: Vec<DeviceId> = dial_partners.borrow().clone();
+                let mut missing = false;
+                // When a paced computer may next be dialed.
+                let mut soonest: Option<Duration> = None;
                 for id in targets {
-                    if dial_connected
-                        .lock()
-                        .map(|c| c.contains(&id))
-                        .unwrap_or(true)
-                    {
+                    let higher = me.as_bytes() > id.as_bytes();
+                    let (linked, addrs, rarely) = match dial_reach.lock() {
+                        Ok(r) => (
+                            r.connected.contains(&id),
+                            r.candidates(&id, higher, started),
+                            r.dropping.contains(&id),
+                        ),
+                        Err(_) => return,
+                    };
+                    if linked {
                         continue;
                     }
-                    let addrs = addresses
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(&id).cloned())
-                        .unwrap_or_default();
+                    missing = true;
+                    // A link that keeps dying is redialed ever more slowly.
+                    if let Some(left) = pace.get_mut(&id).and_then(|p| p.wait(rarely)) {
+                        soonest = Some(soonest.map_or(left, |s: Duration| s.min(left)));
+                        continue;
+                    }
                     for addr in addrs {
                         let Ok(Ok(conn)) =
                             tokio::time::timeout(DIAL_TIMEOUT, node.connect(addr)).await
@@ -557,18 +751,35 @@ impl Core {
                             conn.close();
                             continue;
                         }
-                        if let Ok(mut c) = dial_connected.lock() {
-                            c.insert(id);
+                        if let Ok(mut r) = dial_reach.lock() {
+                            r.connected.insert(id);
                         }
-                        if hand_over(conn, &dial_tx).is_err() {
+                        pace.entry(id).or_insert_with(Pace::new).dialed();
+                        if hand_over(conn, true, &dial_tx).is_err() {
                             return;
                         }
+                        wait = RETRY;
                         break;
                     }
                 }
+                let pause = if missing { wait } else { SETTLED };
                 tokio::select! {
-                    _ = tokio::time::sleep(RETRY) => {}
-                    r = dial_partners.changed() => if r.is_err() { return },
+                    () = tokio::time::sleep(pause) => {
+                        if missing {
+                            wait = (wait * 2).min(RETRY_MAX);
+                        }
+                    }
+                    r = dial_partners.changed() => {
+                        if r.is_err() {
+                            return;
+                        }
+                        wait = RETRY;
+                    }
+                    () = dial_wake.notified() => wait = RETRY,
+                }
+                // Woken early, but someone is paced: don't spin until then.
+                if let Some(left) = soonest {
+                    tokio::time::sleep(left.min(pause)).await;
                 }
             }
         });
@@ -587,7 +798,10 @@ impl Core {
             driven: None,
             partners,
             links: HashMap::new(),
-            connected,
+            dropped: HashMap::new(),
+            reach,
+            redial,
+            discovery_run: 0,
             partners_tx,
             trust,
             discovery,
@@ -627,10 +841,31 @@ impl Core {
     }
 
     fn publish_partners(&self) {
+        let known = self
+            .reach
+            .lock()
+            .map(|r| r.known.clone())
+            .unwrap_or_default();
         let list = self
             .partners
             .iter()
-            .map(|(id, name)| (*id, name.clone(), self.links.contains_key(id)))
+            .map(|(id, name)| {
+                let addr = known
+                    .get(id)
+                    .and_then(|l| l.first())
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_default();
+                let dropping = self.dropped.get(id).is_some_and(|n| *n >= DROPS_TO_TELL);
+                (
+                    *id,
+                    name.clone(),
+                    // A link about to be dropped again isn't a connection.
+                    self.links.contains_key(id) && !dropping,
+                    self.nearby.contains_key(id),
+                    addr,
+                    dropping,
+                )
+            })
             .collect();
         self.emit(Event::Partners(list));
     }
@@ -639,6 +874,7 @@ impl Core {
         let mut list: Vec<(DeviceId, String, bool, bool)> = self
             .nearby
             .iter()
+            .filter(|(_, s)| self.ports.computer || !s.phone)
             .map(|(id, s)| {
                 (
                     *id,
@@ -661,17 +897,41 @@ impl Core {
 
     async fn on_internal(&mut self, ev: Internal) {
         match ev {
-            Internal::Connected(id, sender, mut rx) => {
+            Internal::Connected(link) => {
+                let NewLink {
+                    id,
+                    dialed,
+                    addr,
+                    sender,
+                    mut rx,
+                } = link;
                 if !self.partners.iter().any(|(p, _)| *p == id) {
+                    sender.close();
+                    return;
+                }
+                let me_higher = self.identity.id().as_bytes() > id.as_bytes();
+                if let Some(old) = self.links.get(&id)
+                    && !replaces(me_higher, old.dialed, dialed)
+                {
                     sender.close();
                     return;
                 }
                 let generation = self.next_generation;
                 self.next_generation += 1;
-                if let Ok(mut c) = self.connected.lock() {
-                    c.insert(id);
+                let remembered = self.reach.lock().is_ok_and(|mut r| {
+                    r.connected.insert(id);
+                    r.remember(id, addr)
+                });
+                if remembered {
+                    self.save_addresses();
                 }
-                if let Some(old) = self.links.insert(id, Link { sender, generation }) {
+                let link = Link {
+                    sender,
+                    generation,
+                    dialed,
+                    since: Instant::now(),
+                };
+                if let Some(old) = self.links.insert(id, link) {
                     old.sender.close();
                 }
                 let fwd = self.tx.clone();
@@ -711,10 +971,28 @@ impl Core {
                     self.control(Control::Hide);
                 }
                 if self.links.get(&id).map(|l| l.generation) == Some(generation) {
-                    self.links.remove(&id);
-                    if let Ok(mut c) = self.connected.lock() {
-                        c.remove(&id);
+                    // A computer that won't keep the link (it forgot this
+                    // phone, or runs a version that can't) accepts it, then
+                    // drops it at once. Anything else is an ordinary lost
+                    // link.
+                    let refused = self
+                        .links
+                        .remove(&id)
+                        .is_some_and(|l| l.since.elapsed() < DROPPED_WITHIN);
+                    if refused {
+                        let n = self.dropped.entry(id).or_insert(0);
+                        *n = n.saturating_add(1);
+                        if *n >= DROPS_TO_TELL
+                            && let Ok(mut r) = self.reach.lock()
+                        {
+                            r.dropping.insert(id);
+                        }
+                    } else if self.dropped.remove(&id).is_some()
+                        && let Ok(mut r) = self.reach.lock()
+                    {
+                        r.dropping.remove(&id);
                     }
+                    self.unlinked(id);
                     if self.controlling == Some(id) {
                         self.controlling = None;
                         self.emit(Event::Controlling(None));
@@ -722,9 +1000,27 @@ impl Core {
                     self.publish_partners();
                 }
             }
-            Internal::Nearby(map) => {
+            Internal::Nearby(run, map) => {
+                // Announcements repeat; only a real change is worth acting on.
+                if run != self.discovery_run || map == self.nearby {
+                    return;
+                }
+                if let Ok(mut r) = self.reach.lock() {
+                    r.found = map.iter().map(|(id, s)| (*id, s.addrs.clone())).collect();
+                }
+                let partner_seen = |m: &HashMap<DeviceId, Seen>| -> Vec<bool> {
+                    self.partners
+                        .iter()
+                        .map(|(id, _)| m.contains_key(id))
+                        .collect()
+                };
+                let partners_moved = partner_seen(&map) != partner_seen(&self.nearby);
                 self.nearby = map;
+                self.redial.notify_one();
                 self.publish_nearby();
+                if partners_moved {
+                    self.publish_partners();
+                }
                 self.join_open_windows();
             }
             Internal::Compare { name, code, answer } => {
@@ -736,12 +1032,24 @@ impl Core {
                 self.emit(Event::PairingConfirm { name, code });
             }
             Internal::Paired(result) => {
-                let auto = self.pairing.take().is_some_and(|p| p.auto);
+                let done = self.pairing.take();
+                let auto = done.as_ref().is_some_and(|p| p.auto);
+                let typed = done.and_then(|p| p.typed);
                 let _ = self.discovery.set_pairing(None, 0);
                 match result {
                     Ok(peer) => {
                         if !self.partners.iter().any(|(p, _)| *p == peer.id) {
                             self.partners.push((peer.id, peer.name.clone()));
+                        }
+                        match typed {
+                            Some(ip) => self.set_address(peer.id, SocketAddr::new(ip, LINK_PORT)),
+                            // The usual side dials first; this one only
+                            // joins in if that gets nowhere.
+                            None => {
+                                if let Ok(mut r) = self.reach.lock() {
+                                    r.unlinked.insert(peer.id, Instant::now());
+                                }
+                            }
                         }
                         self.trust.add(peer.id);
                         self.store.save_partners(&self.partners);
@@ -782,9 +1090,31 @@ impl Core {
             }
             Command::Join(id) => {
                 if let Some(seen) = self.nearby.get(&id).cloned() {
-                    self.start_guest(&seen, false);
+                    self.start_guest(&seen, false, None);
                 }
             }
+            Command::JoinAddress(text) => match parse_address(&text, PAIRING_PORT) {
+                Ok(addr) => {
+                    let seen = Seen {
+                        name: String::new(),
+                        addrs: vec![addr],
+                        pairing: None,
+                        pairing_port: addr.port(),
+                        phone: false,
+                    };
+                    self.start_guest(&seen, false, Some(addr.ip()));
+                }
+                Err(e) => self.emit(Event::PairingFailed(e)),
+            },
+            Command::SetAddress(id, text) => match parse_address(&text, LINK_PORT) {
+                Ok(addr) if self.partners.iter().any(|(p, _)| *p == id) => {
+                    self.set_address(id, addr);
+                    self.publish_partners();
+                }
+                Ok(_) => {}
+                Err(e) => self.emit(Event::Error(e)),
+            },
+            Command::NetworkChanged => self.network_changed().await,
             Command::Control(id) => {
                 if self.controlling == Some(id) {
                     return;
@@ -865,12 +1195,17 @@ impl Core {
                 }
                 self.partners.retain(|(p, _)| *p != id);
                 self.trust.remove(&id);
+                self.dropped.remove(&id);
                 if let Some(link) = self.links.remove(&id) {
                     link.sender.close();
                 }
-                if let Ok(mut c) = self.connected.lock() {
-                    c.remove(&id);
+                if let Ok(mut r) = self.reach.lock() {
+                    r.connected.remove(&id);
+                    r.known.remove(&id);
+                    r.unlinked.remove(&id);
+                    r.dropping.remove(&id);
                 }
+                self.save_addresses();
                 self.store.save_partners(&self.partners);
                 let _ = self
                     .partners_tx
@@ -908,6 +1243,66 @@ impl Core {
 
     fn control(&self, c: Control) {
         let _ = self.controls.send(c);
+    }
+
+    fn save_addresses(&self) {
+        if let Ok(r) = self.reach.lock() {
+            self.store.save_addresses(&r.known);
+        }
+    }
+
+    /// Notes that `id` has no link now, and has the dial loop try at once.
+    fn unlinked(&self, id: DeviceId) {
+        if let Ok(mut r) = self.reach.lock() {
+            r.connected.remove(&id);
+            r.unlinked.insert(id, Instant::now());
+        }
+        self.redial.notify_one();
+    }
+
+    /// Makes `addr` the first place to look for `id`, and looks now.
+    fn set_address(&self, id: DeviceId, addr: SocketAddr) {
+        if let Ok(mut r) = self.reach.lock() {
+            r.remember(id, addr);
+            // Either side may dial a typed address straight away.
+            r.unlinked.insert(id, Instant::now() - FALLBACK);
+        }
+        self.save_addresses();
+        self.redial.notify_one();
+    }
+
+    /// The phone is on another network (or none): links over the old one
+    /// are dead, and what was nearby no longer is. Starts looking afresh.
+    async fn network_changed(&mut self) {
+        if let Some(d) = self.driven.take() {
+            self.control(Control::Hide);
+            self.send_to(d.by, &Message::Leave).await;
+        }
+        self.release().await;
+        let ids: Vec<DeviceId> = self.links.keys().copied().collect();
+        for id in ids {
+            if let Some(link) = self.links.remove(&id) {
+                link.sender.close();
+            }
+            self.unlinked(id);
+        }
+        if self.pairing.as_ref().is_some_and(|p| p.answer.is_none()) {
+            self.cancel_quietly();
+            self.emit(Event::PairingClosed);
+        }
+        self.discovery_run += 1;
+        self.nearby.clear();
+        if let Ok(mut r) = self.reach.lock() {
+            r.found.clear();
+        }
+        if let Ok((discovery, found)) = discover(&self.identity, self.ports) {
+            // Dropping the old one says goodbye on whatever network is left.
+            self.discovery = discovery;
+            watch_discovery(found, self.discovery_run, self.tx.clone());
+        }
+        self.redial.notify_one();
+        self.publish_nearby();
+        self.publish_partners();
     }
 
     /// What computers are told about this phone: its screen (they may drive
@@ -1106,10 +1501,11 @@ impl Core {
             task,
             answer: None,
             auto: false,
+            typed: None,
         });
     }
 
-    fn start_guest(&mut self, seen: &Seen, auto: bool) {
+    fn start_guest(&mut self, seen: &Seen, auto: bool, typed: Option<IpAddr>) {
         self.cancel_quietly();
         let addrs: Vec<SocketAddr> = seen
             .addrs
@@ -1136,6 +1532,7 @@ impl Core {
             task,
             answer: None,
             auto,
+            typed,
         });
     }
 
@@ -1152,14 +1549,18 @@ impl Core {
         if self.pairing.is_some() {
             return;
         }
-        let candidate = self.nearby.iter().find_map(|(id, s)| {
-            let token = s.pairing.clone()?;
-            let fresh = !self.tried.contains(&(*id, token.clone()));
-            (fresh && !self.links.contains_key(id)).then(|| (*id, token, s.clone()))
-        });
+        let candidate = self
+            .nearby
+            .iter()
+            .filter(|(_, s)| self.ports.computer || !s.phone)
+            .find_map(|(id, s)| {
+                let token = s.pairing.clone()?;
+                let fresh = !self.tried.contains(&(*id, token.clone()));
+                (fresh && !self.links.contains_key(id)).then(|| (*id, token, s.clone()))
+            });
         if let Some((id, token, seen)) = candidate {
             self.tried.insert((id, token));
-            self.start_guest(&seen, true);
+            self.start_guest(&seen, true, None);
         }
     }
 }
@@ -1185,8 +1586,67 @@ fn to_i32(v: f32) -> i32 {
     }
 }
 
-fn hand_over(conn: PeerConnection, tx: &mpsc::UnboundedSender<Internal>) -> Result<(), ()> {
+type Found = std_mpsc::Receiver<DiscoveryEvent>;
+
+fn discover(
+    identity: &Identity,
+    ports: Ports,
+) -> Result<(Discovery, Found), hopwyn_discovery::DiscoveryError> {
+    if ports.computer {
+        Discovery::start(identity, ports.link)
+    } else {
+        Discovery::start_phone(identity, ports.link)
+    }
+}
+
+/// Forwards what discovery finds to the core, as whole snapshots.
+fn watch_discovery(
+    found: std_mpsc::Receiver<DiscoveryEvent>,
+    run: u64,
+    tx: mpsc::UnboundedSender<Internal>,
+) {
+    std::thread::spawn(move || {
+        let mut seen: HashMap<DeviceId, Seen> = HashMap::new();
+        while let Ok(ev) = found.recv() {
+            match ev {
+                DiscoveryEvent::Found(d) => {
+                    let v4: Vec<SocketAddr> = d
+                        .addrs
+                        .iter()
+                        .copied()
+                        .filter(SocketAddr::is_ipv4)
+                        .collect();
+                    if !v4.is_empty() {
+                        seen.insert(
+                            d.id,
+                            Seen {
+                                name: d.name,
+                                addrs: v4,
+                                pairing: d.pairing,
+                                pairing_port: d.pairing_port.unwrap_or(PAIRING_PORT),
+                                phone: d.phone,
+                            },
+                        );
+                    }
+                }
+                DiscoveryEvent::Lost(id) => {
+                    seen.remove(&id);
+                }
+            }
+            if tx.send(Internal::Nearby(run, seen.clone())).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+fn hand_over(
+    conn: PeerConnection,
+    dialed: bool,
+    tx: &mpsc::UnboundedSender<Internal>,
+) -> Result<(), ()> {
     let id = conn.peer();
+    let addr = conn.remote_address();
     let (sender, mut receiver) = conn.split();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -1202,8 +1662,14 @@ fn hand_over(conn: PeerConnection, tx: &mpsc::UnboundedSender<Internal>) -> Resu
             }
         }
     });
-    tx.send(Internal::Connected(id, sender, msg_rx))
-        .map_err(|_| ())
+    tx.send(Internal::Connected(NewLink {
+        id,
+        dialed,
+        addr,
+        sender,
+        rx: msg_rx,
+    }))
+    .map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -1215,11 +1681,19 @@ mod tests {
     #[test]
     fn events_become_lines_the_app_can_split() {
         let id = Identity::generate("Desk").id();
-        let line = Event::Partners(vec![(id, "Desk\u{1f}PC".into(), true)]).to_line();
+        let line = Event::Partners(vec![(
+            id,
+            "Desk\u{1f}PC".into(),
+            true,
+            false,
+            "192.168.1.20".into(),
+            false,
+        )])
+        .to_line();
         assert!(line.starts_with("partners\u{1f}"));
         // A separator inside a name is removed, so fields stay aligned.
         assert_eq!(line.matches('\u{1f}').count(), 1);
-        assert!(line.contains("DeskPC\u{1d}1"));
+        assert!(line.contains("DeskPC\u{1d}1\u{1d}0\u{1d}192.168.1.20\u{1d}0"));
         assert_eq!(
             Event::PairingConfirm {
                 name: "Desk".into(),
@@ -1229,6 +1703,84 @@ mod tests {
             "pairing-confirm\u{1f}Desk\u{1f}123456"
         );
         assert_eq!(Event::Controlling(None).to_line(), "controlling\u{1f}");
+    }
+
+    #[test]
+    fn typed_addresses_must_be_on_the_home_network() {
+        assert_eq!(
+            parse_address(" 192.168.1.20 ", 4243).unwrap(),
+            "192.168.1.20:4243".parse().unwrap()
+        );
+        assert_eq!(
+            parse_address("10.0.0.5:5000", 4243).unwrap(),
+            "10.0.0.5:5000".parse().unwrap()
+        );
+        assert!(parse_address("8.8.8.8", 4243).is_err());
+        assert!(parse_address("my-laptop", 4243).is_err());
+    }
+
+    #[test]
+    fn both_sides_keep_the_link_the_higher_key_dialed() {
+        // The higher side keeps its own dial over one it accepted.
+        assert!(!replaces(true, true, false));
+        assert!(replaces(true, false, true));
+        // The lower side keeps the one it accepted over its own dial.
+        assert!(!replaces(false, false, true));
+        assert!(replaces(false, true, false));
+        // A reconnect of the same kind replaces a stale link.
+        assert!(replaces(true, true, true));
+        assert!(replaces(false, false, false));
+    }
+
+    #[test]
+    fn the_lower_key_waits_before_dialing() {
+        let id = Identity::generate("Desk").id();
+        let addr: SocketAddr = "192.168.1.20:4242".parse().unwrap();
+        let mut reach = Reach::default();
+        reach.remember(id, addr);
+        let now = Instant::now();
+        assert_eq!(reach.candidates(&id, true, now), vec![addr]);
+        assert!(reach.candidates(&id, false, now).is_empty());
+        reach.unlinked.insert(id, now - FALLBACK);
+        assert_eq!(reach.candidates(&id, false, now), vec![addr]);
+        reach.connected.insert(id);
+        assert!(reach.candidates(&id, true, now).is_empty());
+    }
+
+    #[test]
+    fn a_link_that_dies_young_is_redialed_more_slowly() {
+        let mut pace = Pace::new();
+        pace.dialed();
+        // Dropped at once: wait, and longer than the first gap.
+        let first = pace.wait(false).unwrap();
+        assert!(first > RETRY && first <= RETRY * 2);
+        pace.dialed();
+        let second = pace.wait(false).unwrap();
+        assert!(second > first);
+        // A link that lasted is redialed without delay.
+        pace.dialed();
+        pace.dialed_at = Instant::now() - Pace::LASTED;
+        assert!(pace.wait(false).is_none());
+        assert_eq!(pace.gap, RETRY);
+        // One that refuses every link is only tried now and then.
+        pace.dialed();
+        assert!(pace.wait(true).unwrap() > RETRY_MAX);
+    }
+
+    #[test]
+    fn the_newest_address_is_tried_first() {
+        let id = Identity::generate("Desk").id();
+        let mut reach = Reach::default();
+        for n in 1..=6u8 {
+            reach.remember(id, SocketAddr::from(([192, 168, 1, n], 4242)));
+        }
+        let known = reach.known.get(&id).unwrap();
+        assert_eq!(known.len(), MAX_KNOWN);
+        assert_eq!(
+            known.first(),
+            Some(&SocketAddr::from(([192, 168, 1, 6], 4242)))
+        );
+        assert!(!reach.remember(id, SocketAddr::from(([192, 168, 1, 6], 4242))));
     }
 
     #[test]

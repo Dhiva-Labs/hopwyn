@@ -44,6 +44,7 @@ fn a_computer_drives_the_phone_and_comes_back() {
         Ports {
             link: 4302,
             pairing: 4303,
+            computer: false,
         },
     )
     .unwrap();
@@ -53,6 +54,7 @@ fn a_computer_drives_the_phone_and_comes_back() {
         Ports {
             link: 4312,
             pairing: 4313,
+            computer: true,
         },
     )
     .unwrap();

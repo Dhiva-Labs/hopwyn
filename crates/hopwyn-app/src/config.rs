@@ -8,9 +8,14 @@
 //!   so the remote-control dialog is shown once, not on every handoff.
 //! - `settings`: `key=value` lines: `sharing` (on/off) and `ask`
 //!   (`online` or `startup`: when to ask for the input-capture permission).
+//! - `addresses`: where each paired device was last reached, one per line:
+//!   key, then its addresses, newest first. Lets devices reconnect on
+//!   networks where they can't find each other on their own.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -21,6 +26,25 @@ use hopwyn_proto::Edge;
 /// online at a time; computers that are never on together (a home and an
 /// office desktop) can share a side.
 pub const MAX_PARTNERS: usize = 16;
+
+/// Most addresses remembered for one paired device (home, office, ...).
+pub const MAX_ADDRESSES: usize = 4;
+
+/// Where each paired device was last reached, newest first.
+pub type Addresses = HashMap<DeviceId, Vec<SocketAddr>>;
+
+/// Puts `addr` first in `id`'s list, dropping the oldest beyond
+/// [`MAX_ADDRESSES`]. Returns whether the list changed.
+pub fn remember_address(map: &mut Addresses, id: DeviceId, addr: SocketAddr) -> bool {
+    let list = map.entry(id).or_default();
+    if list.first() == Some(&addr) {
+        return false;
+    }
+    list.retain(|a| *a != addr);
+    list.insert(0, addr);
+    list.truncate(MAX_ADDRESSES);
+    true
+}
 
 /// When to ask the desktop for the input-capture permission. GNOME 50 and
 /// older forget it at logout, so this decides when the dialog appears.
@@ -156,6 +180,46 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Where paired devices were last reached. A missing or damaged file
+    /// is an empty list: bad lines and bad addresses are skipped.
+    pub fn addresses(&self) -> Addresses {
+        let text = read_private(&self.dir.join("addresses"))
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        let mut out = Addresses::new();
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let Some(id) = parts.next().and_then(parse_hex_id) else {
+                continue;
+            };
+            let mut addrs: Vec<SocketAddr> = Vec::new();
+            for a in parts.filter_map(|a| a.parse::<SocketAddr>().ok()) {
+                if addrs.len() < MAX_ADDRESSES && !addrs.contains(&a) {
+                    addrs.push(a);
+                }
+            }
+            if !addrs.is_empty() && out.len() < MAX_PARTNERS {
+                out.entry(id).or_insert(addrs);
+            }
+        }
+        out
+    }
+
+    pub fn save_addresses(&self, map: &Addresses) -> Result<(), String> {
+        let mut lines: Vec<String> = map
+            .iter()
+            .filter(|(_, addrs)| !addrs.is_empty())
+            .map(|(id, addrs)| {
+                let list: Vec<String> = addrs.iter().map(SocketAddr::to_string).collect();
+                format!("{} {}\n", hex_id(id), list.join(" "))
+            })
+            .collect();
+        lines.sort();
+        write_private(&self.dir.join("addresses"), lines.concat().as_bytes())
     }
 
     pub fn restore_token(&self) -> Option<String> {
@@ -416,6 +480,63 @@ mod tests {
         };
         s.save_settings(off).unwrap();
         assert_eq!(s.settings(), off);
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn addresses_round_trip() {
+        let s = temp_store();
+        assert!(s.addresses().is_empty());
+        let (a, b) = (Identity::generate("a").id(), Identity::generate("b").id());
+        let mut map = Addresses::new();
+        map.insert(a, vec![addr("192.168.1.20:4242"), addr("10.0.0.7:4242")]);
+        map.insert(b, vec![addr("192.168.1.31:4242")]);
+        s.save_addresses(&map).unwrap();
+        assert_eq!(s.addresses(), map);
+    }
+
+    #[test]
+    fn damaged_address_file_is_read_as_far_as_it_makes_sense() {
+        let s = temp_store();
+        let a = Identity::generate("a").id();
+        let text = format!(
+            "nonsense\n{} not-an-address 192.168.1.20:4242 192.168.1.20:4242\n\x01\x02 ::\n{}\n",
+            hex_id(&a),
+            hex_id(&Identity::generate("b").id()),
+        );
+        write_private(&s.dir.join("addresses"), text.as_bytes()).unwrap();
+        let map = s.addresses();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&a), Some(&vec![addr("192.168.1.20:4242")]));
+        write_private(&s.dir.join("addresses"), &[0xff, 0xfe, 0x00]).unwrap();
+        assert!(s.addresses().is_empty());
+    }
+
+    #[test]
+    fn newest_address_goes_first_and_the_oldest_falls_off() {
+        let id = Identity::generate("a").id();
+        let mut map = Addresses::new();
+        for n in 1..=5 {
+            assert!(remember_address(
+                &mut map,
+                id,
+                addr(&format!("10.0.0.{n}:4242"))
+            ));
+        }
+        let list = map.get(&id).unwrap();
+        assert_eq!(list.len(), MAX_ADDRESSES);
+        assert_eq!(list.first(), Some(&addr("10.0.0.5:4242")));
+        assert!(!list.contains(&addr("10.0.0.1:4242")));
+        // Already first: nothing to save.
+        assert!(!remember_address(&mut map, id, addr("10.0.0.5:4242")));
+        // Seen before: moves to the front without a duplicate.
+        assert!(remember_address(&mut map, id, addr("10.0.0.3:4242")));
+        let list = map.get(&id).unwrap();
+        assert_eq!(list.first(), Some(&addr("10.0.0.3:4242")));
+        assert_eq!(list.len(), MAX_ADDRESSES);
     }
 
     #[test]

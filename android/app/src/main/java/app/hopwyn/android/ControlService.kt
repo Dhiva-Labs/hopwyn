@@ -2,20 +2,24 @@ package app.hopwyn.android
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Path
 import android.graphics.PixelFormat
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.view.Gravity
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.ImageView
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import kotlin.concurrent.thread
 
 /**
@@ -28,38 +32,66 @@ import kotlin.concurrent.thread
  */
 class ControlService : AccessibilityService() {
     companion object {
-        /** Whether the service is on, for the app's status card. */
-        @Volatile
-        var active = false
+        /** Whether the service is on. Screens redraw when it changes. */
+        var active by mutableStateOf(false)
             private set
+
+        /** The running service, which performs what the core asks for. */
+        @Volatile
+        private var current: ControlService? = null
+        private val main = Handler(Looper.getMainLooper())
+        private var reader: Thread? = null
+
+        private var returnUntil = 0L
+
+        /**
+         * The user is off to Accessibility settings to turn this on: bring
+         * them back to Hopwyn when they do, instead of leaving them there.
+         */
+        fun returnWhenOn() {
+            returnUntil = SystemClock.elapsedRealtime() + 5 * 60_000
+        }
+
+        /**
+         * One thread for the life of the process waits for the core's next
+         * action, asleep until there is one, and hands it to whichever
+         * service is running.
+         */
+        @Synchronized
+        private fun startReader() {
+            if (reader != null) return
+            reader = thread(name = "hopwyn-control", isDaemon = true) {
+                while (true) {
+                    val line = Native.nativeNextControl(60_000) ?: continue
+                    main.post { current?.perform(line) }
+                }
+            }
+        }
     }
 
-    @Volatile
     private var running = false
-    private val main = Handler(Looper.getMainLooper())
     private lateinit var windows: WindowManager
     private var pointer: ImageView? = null
     private var pointerParams: WindowManager.LayoutParams? = null
-    // Finding computers (mDNS) needs multicast, which Android drops unless
-    // asked; the app's screen may not be open while this service runs.
-    private var multicast: WifiManager.MulticastLock? = null
 
     override fun onServiceConnected() {
         windows = getSystemService(WINDOW_SERVICE) as WindowManager
-        multicast = (applicationContext.getSystemService(WIFI_SERVICE) as WifiManager)
-            .createMulticastLock("hopwyn-control")
-            .apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-        Native.nativeStart(filesDir.absolutePath, deviceName(this))
+        if (Core.start(this) != null) return
+        // The app's screen may not be open: listen for computers a while.
+        Core.listenForAWhile()
+        running = true
+        current = this
         reportSize()
         active = true
-        running = true
-        thread(name = "hopwyn-control", isDaemon = true) {
-            while (running) {
-                val line = Native.nativeNextControl(250) ?: continue
-                main.post { perform(line) }
+        Prefs.get(this).noteControl(true)
+        startReader()
+        if (SystemClock.elapsedRealtime() < returnUntil) {
+            returnUntil = 0
+            runCatching {
+                startActivity(
+                    Intent(this, MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                )
             }
         }
     }
@@ -69,7 +101,7 @@ class ControlService : AccessibilityService() {
         if (running) reportSize()
     }
 
-    override fun onUnbind(intent: android.content.Intent?): Boolean {
+    override fun onUnbind(intent: Intent?): Boolean {
         stop()
         return super.onUnbind(intent)
     }
@@ -87,10 +119,9 @@ class ControlService : AccessibilityService() {
         if (!running) return
         running = false
         active = false
+        if (current === this) current = null
         Native.nativeSetControllable(false, 0, 0)
         hidePointer()
-        multicast?.release()
-        multicast = null
     }
 
     /** Tells the core the full screen size (rotation changes it). */

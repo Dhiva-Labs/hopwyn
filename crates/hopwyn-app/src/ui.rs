@@ -134,11 +134,15 @@ struct Ui {
     cmd: UnboundedSender<Command>,
     partners: RefCell<Vec<Partner>>,
     status: RefCell<(Vec<DeviceId>, Control)>,
+    /// Paired devices that drop every link: they forgot this computer.
+    dropping: RefCell<Vec<DeviceId>>,
     ready: Cell<bool>,
     failed: Cell<bool>,
     /// The window was hidden when a permission dialog needed it: hide it
     /// again once permission is granted.
     hide_after_input: Cell<bool>,
+    /// Where the input permission stands, for the status card.
+    input: Cell<InputState>,
     /// The window should hand itself to the service once it's on screen.
     export_pending: Cell<bool>,
     sharing_row: adw::SwitchRow,
@@ -363,9 +367,11 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         cmd,
         partners: RefCell::new(Vec::new()),
         status: RefCell::new((Vec::new(), Control::Local)),
+        dropping: RefCell::new(Vec::new()),
         ready: Cell::new(false),
         failed: Cell::new(false),
         hide_after_input: Cell::new(false),
+        input: Cell::new(InputState::Waiting),
         export_pending: Cell::new(false),
         sharing_row: sharing_row.clone(),
         ask_row: ask_row.clone(),
@@ -497,13 +503,14 @@ impl Ui {
         match ev {
             UiEvent::Waiting(text) => {
                 self.banner.set_title(&format!(
-                    "{text}. If you don't see it, press the Super key."
+                    "{text}. It may be behind this window: press the Super key to find it."
                 ));
+                self.banner.set_button_label(None);
                 self.banner.set_revealed(true);
                 self.set_card(
                     "preferences-system-privacy-symbolic",
-                    "Waiting for permission",
-                    &text,
+                    "Waiting for you to allow input sharing",
+                    &format!("{text}. Hopwyn carries on as soon as you answer."),
                     "",
                 );
             }
@@ -560,8 +567,12 @@ impl Ui {
                 self.refresh_partners();
                 self.refresh_card();
             }
+            UiEvent::Dropping(list) => {
+                *self.dropping.borrow_mut() = list;
+                self.refresh_partner_status();
+            }
             UiEvent::Nearby(list) => self.refresh_nearby(&list),
-            UiEvent::PairingOpen => self.show_waiting(),
+            UiEvent::PairingOpen(addresses) => self.show_waiting(&addresses),
             UiEvent::PairingConfirm { name, code } => self.show_compare(&name, &code),
             UiEvent::PairingClosed => {
                 self.close_code_dialog();
@@ -598,18 +609,19 @@ impl Ui {
             ),
             InputState::Waiting => ("Will ask for permission when it's needed", None),
             InputState::Asking => (
-                "Asking for permission",
+                "Waiting for you to allow it",
                 Some(
-                    "Allow Hopwyn in the desktop's dialog. If you don't see it, press the Super key.",
+                    "Waiting for you to allow input sharing. Look for the system dialog: it may be behind this window (press the Super key to find it).",
                 ),
             ),
             InputState::Ready => ("On: the screen edges are live", None),
             InputState::Refused => (
-                "Permission not given",
-                Some("Hopwyn needs permission to use the screen edges."),
+                "Not allowed: the screen edges do nothing",
+                Some("Input sharing isn't allowed, so the screen edges do nothing."),
             ),
             InputState::Disabled => ("Test mode: no input", None),
         };
+        self.input.set(state);
         self.sharing_row.set_subtitle(subtitle);
         match banner {
             Some(text) => {
@@ -623,9 +635,7 @@ impl Ui {
         if state == InputState::Ready && self.hide_after_input.replace(false) {
             self.window.set_visible(false);
         }
-        if state != InputState::Asking {
-            self.refresh_card();
-        }
+        self.refresh_card();
     }
 
     fn dismiss_waiting(&self) {
@@ -666,6 +676,25 @@ impl Ui {
         }
         let partners = self.partners.borrow().clone();
         let (connected, control) = self.status.borrow().clone();
+        // The desktop's dialog is up: nothing else matters until it's answered.
+        if self.input.get() == InputState::Asking {
+            self.set_card(
+                "preferences-system-privacy-symbolic",
+                "Waiting for you to allow input sharing",
+                "Look for the system dialog: it may be behind this window. Press the Super key to find it.",
+                "",
+            );
+            return;
+        }
+        if !partners.is_empty() && self.input.get() == InputState::Refused {
+            self.set_card(
+                "dialog-warning-symbolic",
+                "Input sharing isn't allowed",
+                "The screen edges do nothing until you allow it. Click Allow… above to be asked again.",
+                "problem",
+            );
+            return;
+        }
         if partners.is_empty() {
             self.set_card(
                 "computer-symbolic",
@@ -727,6 +756,8 @@ impl Ui {
                 matches!(control, Control::Controlling(c) | Control::ControlledBy(c) if c == *id);
             let state = if active {
                 "In use"
+            } else if self.dropping.borrow().contains(id) {
+                "Keeps dropping the connection. Update Hopwyn on it, or forget it here and pair again."
             } else if connected.contains(id) {
                 "Connected"
             } else {
@@ -846,7 +877,9 @@ impl Ui {
             return;
         }
         if self.partners.borrow().len() >= MAX_PARTNERS {
-            self.toast("Hopwyn is paired with 4 computers, one on each side. Forget one first");
+            self.toast(&format!(
+                "Hopwyn is paired with {MAX_PARTNERS} devices, the most it keeps. Forget one first"
+            ));
             return;
         }
         let _ = self.cmd.send(Command::AddDevice);
@@ -874,19 +907,24 @@ impl Ui {
     }
 
     /// "Add computer" is open: tell the user what happens next.
-    fn show_waiting(self: &Rc<Self>) {
+    fn show_waiting(self: &Rc<Self>, addresses: &[std::net::Ipv4Addr]) {
         let spinner = gtk::Spinner::builder()
             .spinning(true)
             .width_request(32)
             .height_request(32)
             .halign(gtk::Align::Center)
             .build();
-        let dialog = adw::AlertDialog::new(
-            Some("Waiting for the other computer"),
-            Some(
-                "Open Hopwyn on the other computer. It will show a pairing code on its own within a few seconds.",
-            ),
+        let mut body = String::from(
+            "Open Hopwyn on the other device. It will show a pairing code on its own within a few seconds.",
         );
+        if !addresses.is_empty() {
+            let list: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+            body.push_str(&format!(
+                "\n\nNot showing up on the other device? Choose Enter address there and type {}.",
+                list.join(" or ")
+            ));
+        }
+        let dialog = adw::AlertDialog::new(Some("Waiting for the other device"), Some(&body));
         dialog.set_extra_child(Some(&spinner));
         dialog.add_response("cancel", "Cancel");
         dialog.set_close_response("cancel");

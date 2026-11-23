@@ -1,19 +1,12 @@
 package app.hopwyn.android
 
-import android.content.ActivityNotFoundException
-import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
-import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.graphics.luminance
 import androidx.activity.viewModels
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -21,12 +14,12 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.BatteryAlert
@@ -37,15 +30,14 @@ import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.Settings as SettingsIcon
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -56,18 +48,34 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+
+private enum class Screen { Home, Settings, Setup, Pair }
 
 class MainActivity : ComponentActivity() {
     private val model: HopwynModel by viewModels()
+
+    override fun onStart() {
+        super.onStart()
+        Core.setForeground(true)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // The user may be back from changing a setting.
+        model.refresh()
+    }
+
+    override fun onStop() {
+        Core.setForeground(false)
+        super.onStop()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,15 +83,14 @@ class MainActivity : ComponentActivity() {
         setContent {
             HopwynTheme(prefs) {
                 val controlling = model.controlling
-                var settings by rememberSaveable { mutableStateOf(false) }
-                var disclosing by remember { mutableStateOf(false) }
-                val turnOnControl = {
-                    if (prefs.controlDisclosed) openAccessibility(this) else disclosing = true
-                }
-                val keepRunning = { openBatterySettings(this) }
+                var screen by rememberSaveable { mutableStateOf(Screen.Home) }
+                val home = { screen = Screen.Home }
+                // A computer can start pairing whatever screen is showing.
+                val comparing = model.pairing is PairingState.Confirm || model.pairing is PairingState.Waiting
 
                 // System bar icons follow the screen shown, not the phone's theme.
-                val dark = controlling != null || MaterialTheme.colorScheme.background.luminance() < 0.5f
+                val trackpad = controlling != null && !comparing && screen != Screen.Pair
+                val dark = trackpad || MaterialTheme.colorScheme.background.luminance() < 0.5f
                 LaunchedEffect(dark) {
                     val clear = android.graphics.Color.TRANSPARENT
                     val style = if (dark) SystemBarStyle.dark(clear) else SystemBarStyle.light(clear, clear)
@@ -91,33 +98,26 @@ class MainActivity : ComponentActivity() {
                 }
 
                 when {
+                    screen == Screen.Pair || comparing ->
+                        PairScreen(model, byUser = screen == Screen.Pair, onClose = home)
                     controlling != null -> {
                         val name = model.computers.firstOrNull { it.id == controlling }?.name ?: "computer"
                         Trackpad(name = name, prefs = prefs, onDone = model::release)
                     }
-                    settings -> SettingsScreen(
+                    screen == Screen.Settings -> SettingsScreen(
                         prefs = prefs,
                         model = model,
-                        onTurnOnControl = turnOnControl,
-                        onKeepRunning = keepRunning,
-                        onBack = { settings = false },
+                        onTurnOnControl = { screen = Screen.Setup },
+                        onKeepRunning = { screen = Screen.Setup },
+                        onBack = home,
                     )
+                    screen == Screen.Setup -> SetupScreen(prefs, model, onBack = home)
                     else -> Home(
                         model,
-                        onSettings = { settings = true },
-                        onTurnOnControl = turnOnControl,
-                        onKeepRunning = keepRunning,
-                    )
-                }
-                PairingDialogs(model)
-                if (disclosing) {
-                    ControlDisclosure(
-                        onAgree = {
-                            disclosing = false
-                            prefs.agreeToControl()
-                            openAccessibility(this)
-                        },
-                        onDecline = { disclosing = false },
+                        prefs,
+                        onSettings = { screen = Screen.Settings },
+                        onSetup = { screen = Screen.Setup },
+                        onPair = { screen = Screen.Pair },
                     )
                 }
             }
@@ -125,61 +125,13 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun openAccessibility(context: android.content.Context) =
-    context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-
-/** Hopwyn's App info page, where Battery has the "Unrestricted" choice. */
-private fun openBatterySettings(context: android.content.Context) {
-    val info = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))
-        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    try {
-        context.startActivity(info)
-    } catch (_: ActivityNotFoundException) {
-        context.startActivity(
-            Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        )
-    }
-}
-
-/**
- * Says plainly what phone control can see and do before sending the user to
- * Accessibility settings, as Google Play requires for this permission.
- */
 @Composable
-private fun ControlDisclosure(onAgree: () -> Unit, onDecline: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDecline,
-        icon = { Icon(Icons.Filled.Mouse, null) },
-        title = { Text("Let computers control this phone?") },
-        text = {
-            Column {
-                Text(
-                    "Hopwyn uses Android's Accessibility service so that a computer you paired can use its mouse and keyboard on this phone.",
-                )
-                Spacer(Modifier.size(12.dp))
-                Text("With it on, Hopwyn:", style = MaterialTheme.typography.titleSmall)
-                Text(
-                    "• shows a pointer and turns clicks, drags and scrolling into taps and swipes\n" +
-                        "• presses Back and Home\n" +
-                        "• types into the text field you have selected, which means finding that field on screen",
-                )
-                Spacer(Modifier.size(12.dp))
-                Text(
-                    "It doesn't read, store or send what is on your screen. Nothing leaves your home network, and it only works while a paired computer is connected. You can turn it off any time in Accessibility settings.",
-                )
-            }
-        },
-        confirmButton = { Button(onClick = onAgree) { Text("Agree and turn on") } },
-        dismissButton = { TextButton(onClick = onDecline) { Text("Not now") } },
-    )
-}
-
-@Composable
-fun Home(
+private fun Home(
     model: HopwynModel,
+    prefs: Prefs,
     onSettings: () -> Unit,
-    onTurnOnControl: () -> Unit,
-    onKeepRunning: () -> Unit,
+    onSetup: () -> Unit,
+    onPair: () -> Unit,
 ) {
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(model.message) {
@@ -189,16 +141,18 @@ fun Home(
         }
     }
     var forgetting by remember { mutableStateOf<Computer?>(null) }
+    var addressing by remember { mutableStateOf<Computer?>(null) }
     val computers = model.computers
     val unpaired = model.nearby.filter { !it.paired }
     val muted = LocalHopwynColors.current.muted
+    val network = Core.network
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = model::addComputer,
+                onClick = onPair,
                 icon = { Icon(Icons.Filled.Add, null) },
                 text = { Text("Pair a computer") },
             )
@@ -222,7 +176,34 @@ fun Home(
 
             model.startError?.let { err ->
                 item {
-                    Notice("Hopwyn couldn't start: $err. Close and reopen the app. If that doesn't help, restart the phone.")
+                    Notice(
+                        "Hopwyn couldn't start: $err. Close and reopen the app. If that doesn't help, restart the phone.",
+                        urgent = true,
+                    )
+                }
+            }
+            if (network != NetworkKind.Local) {
+                item {
+                    Notice(
+                        if (network == NetworkKind.None) {
+                            "This phone is offline. Join the Wi-Fi your computers use."
+                        } else {
+                            "This phone is on mobile data. Join the Wi-Fi your computers use, or connect a computer to this phone's hotspot."
+                        },
+                    )
+                }
+            }
+            if (prefs.controlWasOn && !model.controllable) {
+                item {
+                    Notice(
+                        "Phone control is off. If you didn't turn it off, the phone stopped Hopwyn in the background.",
+                        urgent = true,
+                    ) {
+                        Row(Modifier.padding(top = 4.dp)) {
+                            TextButton(onClick = onSetup) { Text("Turn on again") }
+                            TextButton(onClick = { prefs.noteControl(false) }) { Text("Leave it off") }
+                        }
+                    }
                 }
             }
 
@@ -230,19 +211,43 @@ fun Home(
                 DeskMap(
                     computers = computers,
                     onUse = { model.control(it.id) },
-                    onPair = model::addComputer,
+                    onPair = onPair,
                     modifier = Modifier.padding(vertical = 12.dp),
                 )
             }
-            item { Hint(hint(computers, model.controllable)) }
+            item {
+                Text(
+                    hint(computers, model.controllable, network),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = muted,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+            }
 
-            if (!model.controllable || !model.background) {
+            val needControl = !model.controllable && !prefs.controlWasOn
+            if (needControl || !model.background) {
                 item { SectionTitle("Finish setup") }
                 item {
                     Group {
-                        if (!model.controllable) ControlStep(onTurnOnControl)
-                        if (!model.controllable && !model.background) RowDivider()
-                        if (!model.background) BackgroundStep(onKeepRunning)
+                        if (needControl) {
+                            ItemRow(
+                                icon = Icons.Filled.Mouse,
+                                title = "Control this phone",
+                                text = "Use a computer's mouse and keyboard here.",
+                            ) {
+                                FilledTonalButton(onClick = onSetup, Modifier.padding(end = 8.dp)) { Text("Set up") }
+                            }
+                        }
+                        if (needControl && !model.background) RowDivider()
+                        if (!model.background) {
+                            ItemRow(
+                                icon = Icons.Filled.BatteryAlert,
+                                title = "Keep Hopwyn running",
+                                text = "So the phone doesn't stop it and disconnect.",
+                            ) {
+                                FilledTonalButton(onClick = onSetup, Modifier.padding(end = 8.dp)) { Text("Set up") }
+                            }
+                        }
                     }
                 }
             }
@@ -253,7 +258,13 @@ fun Home(
                     Group {
                         computers.forEachIndexed { i, c ->
                             if (i > 0) RowDivider()
-                            ComputerRow(c, onUse = { model.control(c.id) }, onForget = { forgetting = c })
+                            ComputerRow(
+                                c,
+                                network,
+                                onUse = { model.control(c.id) },
+                                onAddress = { addressing = c },
+                                onForget = { forgetting = c },
+                            )
                         }
                     }
                 }
@@ -270,7 +281,11 @@ fun Home(
                                 title = n.name,
                                 text = if (n.open) "Ready to pair" else "Click Add computer on it to pair",
                             ) {
-                                if (n.open) FilledTonalButton(onClick = { model.join(n.id) }) { Text("Pair") }
+                                if (n.open) {
+                                    FilledTonalButton(onClick = { model.join(n.id) }, Modifier.padding(end = 8.dp)) {
+                                        Text("Pair")
+                                    }
+                                }
                             }
                         }
                     }
@@ -282,7 +297,7 @@ fun Home(
                     Icon(Icons.Filled.Lock, null, Modifier.size(14.dp), tint = muted)
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        "Encrypted, on your home network only. No account, no cloud.",
+                        "Encrypted, on your own network only. No account, no cloud.",
                         style = MaterialTheme.typography.bodySmall,
                         color = muted,
                     )
@@ -302,184 +317,90 @@ fun Home(
             dismissButton = { TextButton(onClick = { forgetting = null }) { Text("Cancel") } },
         )
     }
+    addressing?.let { c ->
+        AddressDialog(c, onSave = { model.setAddress(c.id, it); addressing = null }, onClose = { addressing = null })
+    }
 }
 
 /** One line under the map saying what to do next. */
-private fun hint(computers: List<Computer>, controllable: Boolean): String = when {
+private fun hint(computers: List<Computer>, controllable: Boolean, network: NetworkKind): String = when {
     computers.isEmpty() ->
-        "Pair a computer to start. On the computer, open Hopwyn and click Add computer: this phone asks on its own."
+        "Pair a computer to start. On the computer, open Hopwyn and click Add computer."
+    computers.none { it.online } && network != NetworkKind.Local ->
+        "Your computers can't be reached without Wi-Fi."
+    computers.none { it.online } && computers.any { it.seen && !it.dropping } -> "Connecting to your computer…"
     computers.none { it.online } ->
-        "Your computers aren't connected. Open Hopwyn on one, on the same Wi-Fi as this phone."
+        "Your computers aren't on this network, or Hopwyn isn't open on them. Hopwyn connects on its own when one appears."
     controllable ->
         "Tap a computer to use this phone as its trackpad. Or move the computer's pointer off its screen edge to control this phone."
     else -> "Tap a computer to use this phone as its trackpad."
 }
 
 @Composable
-private fun Hint(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.bodyMedium,
-        color = LocalHopwynColors.current.muted,
-        modifier = Modifier.padding(bottom = 8.dp),
-    )
-}
-
-@Composable
-private fun Notice(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.bodyMedium,
-        color = MaterialTheme.colorScheme.onErrorContainer,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 8.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(MaterialTheme.colorScheme.errorContainer)
-            .padding(16.dp),
-    )
-}
-
-@Composable
-private fun SectionTitle(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.titleSmall,
-        color = MaterialTheme.colorScheme.onBackground,
-        modifier = Modifier.padding(start = 4.dp, top = 24.dp, bottom = 8.dp),
-    )
-}
-
-/** Rows that belong together, on one raised surface. */
-@Composable
-private fun Group(content: @Composable () -> Unit) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant),
-    ) { content() }
-}
-
-@Composable
-private fun RowDivider() =
-    HorizontalDivider(Modifier.padding(start = 60.dp), color = LocalHopwynColors.current.line)
-
-@Composable
-private fun ItemRow(
-    icon: ImageVector,
-    title: String,
-    text: String,
-    dot: Color? = null,
-    trailing: @Composable () -> Unit = {},
+private fun ComputerRow(
+    c: Computer,
+    network: NetworkKind,
+    onUse: () -> Unit,
+    onAddress: () -> Unit,
+    onForget: () -> Unit,
 ) {
-    Row(
-        Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 14.dp, bottom = 14.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(icon, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.width(20.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (dot != null) {
-                    Box(Modifier.size(8.dp).clip(CircleShape).background(dot))
-                    Spacer(Modifier.width(6.dp))
-                }
-                Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        Spacer(Modifier.width(8.dp))
-        trailing()
-    }
-}
-
-@Composable
-private fun ComputerRow(c: Computer, onUse: () -> Unit, onForget: () -> Unit) {
     val extra = LocalHopwynColors.current
     var menu by remember { mutableStateOf(false) }
     ItemRow(
         icon = Icons.Filled.Laptop,
         title = c.name,
-        text = if (c.online) "Connected" else "Not connected",
+        text = when {
+            c.dropping -> "Keeps dropping the connection. Update Hopwyn on it, or forget it here and pair again."
+            c.online -> "Connected"
+            c.seen -> "Connecting…"
+            network != NetworkKind.Local -> "Not connected"
+            else -> "Not found on this network"
+        },
         dot = if (c.online) extra.online else extra.line,
     ) {
         if (c.online) Button(onClick = onUse) { Text("Use") }
         Box {
             IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "More for ${c.name}") }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                DropdownMenuItem(text = { Text("Set address") }, onClick = { menu = false; onAddress() })
                 DropdownMenuItem(text = { Text("Forget") }, onClick = { menu = false; onForget() })
             }
         }
     }
 }
 
+/** Where to look for a computer that a network hides. */
 @Composable
-private fun ControlStep(onTurnOn: () -> Unit) {
-    ItemRow(
-        icon = Icons.Filled.Mouse,
-        title = "Control this phone",
-        text = "Use a computer's mouse and keyboard here.",
-    ) {
-        FilledTonalButton(onClick = onTurnOn) { Text("Turn on") }
-    }
+private fun AddressDialog(c: Computer, onSave: (String) -> Unit, onClose: () -> Unit) {
+    var address by remember { mutableStateOf(c.address) }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Address of ${c.name}") },
+        text = {
+            Column {
+                Text(
+                    "Hopwyn finds computers on its own on most networks. Where it can't, it tries this address. The computer shows its address under Add computer.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.height(16.dp))
+                OutlinedTextField(
+                    value = address,
+                    onValueChange = { v -> address = v.filter { it.isDigit() || it == '.' }.take(15) },
+                    label = { Text("Address") },
+                    placeholder = { Text("192.168.1.20") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(address) }, enabled = looksLikeAddress(address)) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("Cancel") } },
+    )
 }
 
-@Composable
-private fun BackgroundStep(onOpen: () -> Unit) {
-    ItemRow(
-        icon = Icons.Filled.BatteryAlert,
-        title = "Keep Hopwyn running",
-        text = "Open Battery and choose Unrestricted, so the phone doesn't stop it and disconnect.",
-    ) {
-        FilledTonalButton(onClick = onOpen) { Text("Open") }
-    }
-}
-
-@Composable
-fun PairingDialogs(model: HopwynModel) {
-    when (val p = model.pairing) {
-        PairingState.None -> {}
-        PairingState.Open -> AlertDialog(
-            onDismissRequest = {},
-            icon = { CircularProgressIndicator(Modifier.size(32.dp), strokeWidth = 3.dp) },
-            title = { Text("Waiting for a computer") },
-            text = { Text("Open Hopwyn on the computer, on the same Wi-Fi. It shows a pairing code within a few seconds.") },
-            confirmButton = {},
-            dismissButton = { TextButton(onClick = model::cancelPairing) { Text("Cancel") } },
-        )
-        is PairingState.Confirm -> AlertDialog(
-            onDismissRequest = {},
-            title = { Text("Pair with ${p.name}?") },
-            text = {
-                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Pair only if ${p.name} shows this same code.", style = MaterialTheme.typography.bodyMedium)
-                    Spacer(Modifier.size(20.dp))
-                    Text(
-                        p.code.take(3) + " " + p.code.drop(3),
-                        style = CodeStyle,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(MaterialTheme.colorScheme.primaryContainer)
-                            .padding(horizontal = 20.dp, vertical = 8.dp),
-                    )
-                }
-            },
-            confirmButton = { Button(onClick = { model.confirm(true) }) { Text("Pair") } },
-            dismissButton = { TextButton(onClick = { model.confirm(false) }) { Text("Cancel") } },
-        )
-        is PairingState.Waiting -> AlertDialog(
-            onDismissRequest = {},
-            icon = { CircularProgressIndicator(Modifier.size(32.dp), strokeWidth = 3.dp) },
-            title = { Text("Waiting for ${p.name}") },
-            text = { Text("Click Pair on ${p.name} to finish.") },
-            confirmButton = {},
-            dismissButton = { TextButton(onClick = model::cancelPairing) { Text("Cancel") } },
-        )
-    }
-}
-
-/** Back closes the trackpad and gives the computer its own mouse back. */
+/** Back closes a screen (and, for the trackpad, gives the computer its mouse back). */
 @Composable
 fun ReleaseOnBack(onDone: () -> Unit) = BackHandler(onBack = onDone)

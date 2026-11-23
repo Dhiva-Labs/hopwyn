@@ -8,7 +8,7 @@
 //! (or coming from) one neighbour, the others are told to keep their own.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,10 +20,12 @@ use hopwyn_input::linux_capture::LinuxCapture;
 use hopwyn_input::{InputError, InputEvent};
 use hopwyn_pair::{DeviceId, Identity, PairedPeer};
 use hopwyn_proto::{DecodeError, Edge, Message};
-use hopwyn_transport::{Node, PeerConnection, PeerSender, TransportError, TrustStore};
-use tokio::sync::{mpsc, oneshot, watch};
+use hopwyn_transport::{
+    Node, PeerConnection, PeerSender, TransportError, TrustStore, is_home_address,
+};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-use crate::config::{self, AskWhen, MAX_PARTNERS, Partner, Settings, Store};
+use crate::config::{self, Addresses, AskWhen, MAX_PARTNERS, Partner, Settings, Store};
 use crate::layout::{self, Size, Span};
 use crate::pairing_net::{self, PAIRING_PORT, PAIRING_WINDOW, PairNetError};
 
@@ -73,7 +75,14 @@ impl Capture {
     }
 }
 const TICK: Duration = Duration::from_millis(100);
+/// How soon a failed dial is tried again. Doubles while every attempt
+/// fails, up to [`RETRY_MAX`], and starts over when something changes.
 const RETRY: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(15);
+/// The device with the higher key dials. The other one waits this long
+/// without a link, then dials too: on networks where devices can't find
+/// each other, only one of the two may know the other's address.
+const LOWER_DIAL_AFTER: Duration = Duration::from_secs(6);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(4);
 const SESSION_SETTLE: Duration = Duration::from_millis(150);
 /// Far enough to cross any screen in one move.
@@ -173,9 +182,14 @@ pub enum UiEvent {
         control: Control,
     },
     Partners(Vec<Partner>),
+    /// Paired devices that drop every link at once: they have most likely
+    /// forgotten this computer.
+    Dropping(Vec<DeviceId>),
     Nearby(Vec<Nearby>),
-    /// "Add computer" is open, waiting for another computer to join.
-    PairingOpen,
+    /// "Add computer" is open, waiting for another computer to join. Carries
+    /// this computer's home-network addresses, to type on a device that
+    /// can't find it.
+    PairingOpen(Vec<Ipv4Addr>),
     /// Both sides reached the code comparison: show the code, ask the user.
     PairingConfirm {
         name: String,
@@ -292,7 +306,15 @@ enum Internal {
     /// The desktop answered the permission dialogs.
     InputReady(Result<InputParts, String>),
     /// A link to a paired computer is up.
-    Connected(DeviceId, PeerSender, mpsc::UnboundedReceiver<Message>),
+    Connected {
+        id: DeviceId,
+        sender: PeerSender,
+        rx: mpsc::UnboundedReceiver<Message>,
+        /// Where the other end is.
+        addr: SocketAddr,
+        /// This computer dialed it (rather than accepted it).
+        dialed: bool,
+    },
     /// A message on a link; the number tells a link's messages apart from
     /// those of the link it replaced.
     PeerMessage(DeviceId, u64, Message),
@@ -337,6 +359,10 @@ struct Peer {
     engine: Engine,
     sender: Option<PeerSender>,
     generation: u64,
+    /// This computer dialed the current link (rather than accepted it).
+    dialed: bool,
+    /// Links in a row that it dropped at once.
+    dropped: u8,
     /// Answered a clashing Layout with ours on this link already (once per
     /// link, so two computers can't bounce layouts forever).
     layout_replied: bool,
@@ -361,6 +387,12 @@ struct Service {
     peers: Vec<Peer>,
     partners_tx: watch::Sender<Vec<Partner>>,
     connected: Arc<Mutex<HashSet<DeviceId>>>,
+    /// Devices that drop every link at once, which the dialer tries rarely.
+    dropping: Arc<Mutex<HashSet<DeviceId>>>,
+    /// Where each paired computer was last reached (kept on disk).
+    remembered: Arc<Mutex<Addresses>>,
+    /// Tells the dialer that something changed, so it tries again at once.
+    dial_wake: Arc<Notify>,
     token: Option<String>,
     capture: Capture,
     settings: Settings,
@@ -407,10 +439,14 @@ impl Service {
         let (partners_tx, partners_rx) = watch::channel(partners.clone());
         let addresses: Arc<Mutex<HashMap<DeviceId, Vec<SocketAddr>>>> = Arc::default();
         let connected: Arc<Mutex<HashSet<DeviceId>>> = Arc::default();
+        let dropping: Arc<Mutex<HashSet<DeviceId>>> = Arc::default();
+        let remembered = Arc::new(Mutex::new(store.addresses()));
+        let dial_wake = Arc::new(Notify::new());
 
         // Discovery: keep the nearby list and paired computers' addresses current.
         let disc_tx = tx.clone();
         let disc_addrs = addresses.clone();
+        let disc_wake = dial_wake.clone();
         std::thread::spawn(move || {
             let mut seen: HashMap<DeviceId, Seen> = HashMap::new();
             while let Ok(ev) = found.recv() {
@@ -423,8 +459,11 @@ impl Service {
                             .filter(SocketAddr::is_ipv4)
                             .collect();
                         if !v4.is_empty() {
-                            if let Ok(mut m) = disc_addrs.lock() {
-                                m.insert(d.id, v4.clone());
+                            let moved = disc_addrs.lock().is_ok_and(|mut m| {
+                                m.insert(d.id, v4.clone()).as_ref() != Some(&v4)
+                            });
+                            if moved {
+                                disc_wake.notify_one();
                             }
                             seen.insert(
                                 d.id,
@@ -455,7 +494,7 @@ impl Service {
             while let Some(result) = acc_node.accept().await {
                 match result {
                     Ok(conn) if acc_partners.borrow().iter().any(|p| p.id == conn.peer()) => {
-                        if hand_over(conn, &acc_tx).is_err() {
+                        if hand_over(conn, &acc_tx, false).is_err() {
                             break;
                         }
                     }
@@ -465,39 +504,66 @@ impl Service {
             }
         });
 
-        // Outgoing links: for each pair of computers the one with the higher
-        // key dials, so there is never a duplicate connection.
+        // Outgoing links. For each pair of computers the one with the higher
+        // key dials at once; the other dials only after a while without a
+        // link (see `may_dial`). If both get through, `keeps_new_link` has
+        // both ends keep the same connection.
         let dial_tx = tx.clone();
         let me = identity.id();
         let mut dial_partners = partners_rx;
         let dial_connected = connected.clone();
+        let dial_remembered = remembered.clone();
+        let dial_dropping = dropping.clone();
+        let wake = dial_wake.clone();
         tokio::spawn(async move {
             // The address that last worked for each computer goes first.
             let mut good: HashMap<DeviceId, SocketAddr> = HashMap::new();
+            let mut down_since: HashMap<DeviceId, Instant> = HashMap::new();
+            let mut pace: HashMap<DeviceId, Pace> = HashMap::new();
+            let mut delay = RETRY;
             loop {
-                let targets: Vec<DeviceId> = dial_partners
-                    .borrow()
-                    .iter()
-                    .map(|p| p.id)
-                    .filter(|id| me.as_bytes() > id.as_bytes())
-                    .collect();
-                for id in targets {
+                let partners: Vec<DeviceId> = dial_partners.borrow().iter().map(|p| p.id).collect();
+                down_since.retain(|id, _| partners.contains(id));
+                let (mut tried, mut linked) = (false, false);
+                // When a computer that isn't allowed to dial yet may.
+                let mut check_in: Option<Duration> = None;
+                for id in partners {
                     let up = dial_connected
                         .lock()
                         .map(|c| c.contains(&id))
                         .unwrap_or(true);
                     if up {
+                        down_since.remove(&id);
                         continue;
                     }
-                    let mut addrs = addresses
+                    let found = addresses
                         .lock()
                         .ok()
                         .and_then(|m| m.get(&id).cloned())
                         .unwrap_or_default();
-                    if let Some(g) = good.get(&id) {
-                        addrs.sort_by_key(|a| a != g);
+                    let known = dial_remembered
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&id).cloned())
+                        .unwrap_or_default();
+                    let addrs = dial_order(good.get(&id).copied(), &found, &known);
+                    if addrs.is_empty() {
+                        continue;
+                    }
+                    // A link that keeps dying is redialed ever more slowly.
+                    let rarely = dial_dropping.lock().is_ok_and(|d| d.contains(&id));
+                    if let Some(wait) = pace.get_mut(&id).and_then(|p| p.wait(rarely)) {
+                        check_in = Some(check_in.map_or(wait, |c| c.min(wait)));
+                        continue;
+                    }
+                    let down = down_since.entry(id).or_insert_with(Instant::now).elapsed();
+                    if !may_dial(&me, &id, down) {
+                        let left = LOWER_DIAL_AFTER.saturating_sub(down);
+                        check_in = Some(check_in.map_or(left, |c| c.min(left)));
+                        continue;
                     }
                     for addr in addrs {
+                        tried = true;
                         let Ok(Ok(conn)) =
                             tokio::time::timeout(DIAL_TIMEOUT, node.connect(addr)).await
                         else {
@@ -508,18 +574,44 @@ impl Service {
                             continue;
                         }
                         good.insert(id, addr);
+                        pace.entry(id).or_insert_with(Pace::new).dialed();
                         if let Ok(mut c) = dial_connected.lock() {
                             c.insert(id);
                         }
-                        if hand_over(conn, &dial_tx).is_err() {
+                        if hand_over(conn, &dial_tx, true).is_err() {
                             return;
                         }
+                        linked = true;
+                        down_since.remove(&id);
                         break;
                     }
                 }
+                delay = if tried && !linked {
+                    next_retry(delay)
+                } else {
+                    RETRY
+                };
+                // Nothing to dial: sleep until something changes.
+                let sleep = match (tried, check_in) {
+                    (true, Some(c)) => Some(delay.min(c)),
+                    (true, None) => Some(delay),
+                    (false, c) => c,
+                };
+                let changed = async {
+                    match sleep {
+                        Some(d) => tokio::time::sleep(d).await,
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
-                    _ = tokio::time::sleep(RETRY) => {}
-                    r = dial_partners.changed() => if r.is_err() { return },
+                    () = changed => {}
+                    () = wake.notified() => delay = RETRY,
+                    r = dial_partners.changed() => {
+                        if r.is_err() {
+                            return;
+                        }
+                        delay = RETRY;
+                    }
                 }
             }
         });
@@ -531,6 +623,8 @@ impl Service {
                 partner,
                 sender: None,
                 generation: 0,
+                dialed: false,
+                dropped: 0,
                 layout_replied: false,
                 screen: None,
                 return_at: None,
@@ -546,6 +640,9 @@ impl Service {
             peers,
             partners_tx,
             connected,
+            dropping,
+            remembered,
+            dial_wake,
             token: store_token,
             capture: Capture(None),
             settings,
@@ -731,7 +828,13 @@ impl Service {
                 }
                 self.step(i, Input::Peer(m)).await;
             }
-            Internal::Connected(id, sender, mut rx) => {
+            Internal::Connected {
+                id,
+                sender,
+                mut rx,
+                addr,
+                dialed,
+            } => {
                 let Some(i) = self.peer_index(&id) else {
                     sender.close();
                     if let Ok(mut c) = self.connected.lock() {
@@ -739,6 +842,22 @@ impl Service {
                     }
                     return;
                 };
+                // Both computers dialed at once: both keep the same link.
+                let current = self
+                    .peers
+                    .get(i)
+                    .and_then(|p| p.sender.is_some().then_some(p.dialed));
+                if let Some(old_dialed) = current
+                    && !keeps_new_link(&self.identity.id(), &id, old_dialed, dialed)
+                {
+                    self.debug(&format!(
+                        "second link to {}: keeping the first",
+                        self.name(i)
+                    ));
+                    sender.close();
+                    return;
+                }
+                self.remember(id, addr);
                 let generation = self.next_generation;
                 self.next_generation += 1;
                 if let Ok(mut c) = self.connected.lock() {
@@ -749,6 +868,7 @@ impl Service {
                         old.close();
                     }
                     peer.generation = generation;
+                    peer.dialed = dialed;
                     peer.linked_at = Some(Instant::now());
                 }
                 let fwd = self.tx.clone();
@@ -1006,9 +1126,24 @@ impl Service {
         }
         peer.generation = 0;
         let id = peer.partner.id;
+        // A device that won't keep the link (it forgot this one, or runs a
+        // version that can't) accepts it, then drops it at once. Anything
+        // else is an ordinary lost link.
+        let at_once = peer.linked_at.is_some_and(|t| t.elapsed() < DROPPED_WITHIN);
+        let was_dropping = peer.dropped >= DROPS_TO_TELL;
+        peer.dropped = if at_once {
+            peer.dropped.saturating_add(1)
+        } else {
+            0
+        };
+        if (peer.dropped >= DROPS_TO_TELL) != was_dropping {
+            self.publish_dropping();
+        }
         if let Ok(mut c) = self.connected.lock() {
             c.remove(&id);
         }
+        // The dialer starts over without waiting out its back-off.
+        self.dial_wake.notify_one();
         self.debug(&format!("lost the link to {}", self.name(i)));
         self.step(i, Input::PeerDisconnected).await;
         self.update_edges();
@@ -1067,6 +1202,7 @@ impl Service {
                 if let Ok(mut c) = self.connected.lock() {
                     c.remove(&id);
                 }
+                self.forget_addresses(&id);
                 self.partners_changed();
                 self.publish_nearby();
             }
@@ -1344,7 +1480,7 @@ impl Service {
             self.send_ui(UiEvent::PairingFailed(e.to_string()));
             return;
         }
-        self.send_ui(UiEvent::PairingOpen);
+        self.send_ui(UiEvent::PairingOpen(self.my_addresses()));
         let identity = self.identity.clone();
         let tx = self.tx.clone();
         let task = tokio::spawn(async move {
@@ -1504,6 +1640,8 @@ impl Service {
             partner,
             sender: None,
             generation: 0,
+            dialed: false,
+            dropped: 0,
             layout_replied: false,
             screen: None,
             return_at: None,
@@ -1566,11 +1704,28 @@ impl Service {
         }
     }
 
+    /// Tells the window and the dialer which paired devices keep dropping
+    /// the link at once (they have most likely forgotten this one).
+    fn publish_dropping(&mut self) {
+        let list: Vec<DeviceId> = self
+            .peers
+            .iter()
+            .filter(|p| p.dropped >= DROPS_TO_TELL)
+            .map(|p| p.partner.id)
+            .collect();
+        if let Ok(mut d) = self.dropping.lock() {
+            *d = list.iter().copied().collect();
+        }
+        self.send_ui(UiEvent::Dropping(list));
+        self.publish_status();
+    }
+
     fn publish_status(&mut self) {
         let connected: Vec<DeviceId> = self
             .peers
             .iter()
-            .filter(|p| p.sender.is_some())
+            // A link that is about to be dropped again isn't a connection.
+            .filter(|p| p.sender.is_some() && p.dropped < DROPS_TO_TELL)
             .map(|p| p.partner.id)
             .collect();
         let control = self
@@ -1612,6 +1767,39 @@ impl Service {
         self.send_ui(UiEvent::Nearby(list));
     }
 
+    /// Notes where a paired computer was just reached, for next time.
+    fn remember(&self, id: DeviceId, addr: SocketAddr) {
+        let Ok(mut map) = self.remembered.lock() else {
+            return;
+        };
+        if config::remember_address(&mut map, id, addr) {
+            let _ = self.store.save_addresses(&map);
+        }
+    }
+
+    fn forget_addresses(&self, id: &DeviceId) {
+        let Ok(mut map) = self.remembered.lock() else {
+            return;
+        };
+        if map.remove(id).is_some() {
+            let _ = self.store.save_addresses(&map);
+        }
+    }
+
+    /// This computer's addresses on the home network, for the user to type
+    /// on a device that can't find it.
+    fn my_addresses(&self) -> Vec<Ipv4Addr> {
+        let mut towards: Vec<IpAddr> = self
+            .nearby
+            .values()
+            .flat_map(|s| s.addrs.iter().map(SocketAddr::ip))
+            .collect();
+        if let Ok(map) = self.remembered.lock() {
+            towards.extend(map.values().flatten().map(SocketAddr::ip));
+        }
+        local_addresses(&towards)
+    }
+
     fn name(&self, i: usize) -> String {
         self.peers
             .get(i)
@@ -1641,7 +1829,7 @@ fn pairing_token(identity: &Identity) -> String {
 }
 
 fn full_message() -> String {
-    format!("Hopwyn is paired with {MAX_PARTNERS} computers, one on each side. Forget one first.")
+    format!("Hopwyn is paired with {MAX_PARTNERS} devices, the most it keeps. Forget one first.")
 }
 
 fn engine_config(identity: &Identity, partner: &Partner) -> Config {
@@ -1651,8 +1839,142 @@ fn engine_config(identity: &Identity, partner: &Partner) -> Config {
     }
 }
 
-fn hand_over(conn: PeerConnection, tx: &mpsc::UnboundedSender<Internal>) -> Result<(), ()> {
+/// A link dropped this soon was refused rather than lost.
+const DROPPED_WITHIN: Duration = Duration::from_secs(1);
+/// This many refusals in a row and the user is told.
+const DROPS_TO_TELL: u8 = 3;
+/// How often to try a device that keeps refusing.
+const DROPPING_RETRY: Duration = Duration::from_secs(300);
+
+/// Paces redialing one computer. A link normally lasts, and when it drops
+/// it is redialed after a short gap. One that dies soon after coming up
+/// (the other end refuses it, say) would otherwise be redialed in a tight
+/// loop, so the gap doubles each time that happens.
+struct Pace {
+    dialed_at: Instant,
+    gap: Duration,
+    /// Whether the last link's lifetime has been counted.
+    judged: bool,
+}
+
+impl Pace {
+    /// A link that lasted this long was a real one.
+    const SETTLED: Duration = Duration::from_secs(20);
+
+    fn new() -> Self {
+        Self {
+            dialed_at: Instant::now(),
+            gap: RETRY,
+            judged: true,
+        }
+    }
+
+    /// A dial just succeeded.
+    fn dialed(&mut self) {
+        self.dialed_at = Instant::now();
+        self.judged = false;
+    }
+
+    /// The link is down: how long to wait before dialing again, if at all.
+    /// `rarely`: it drops every link, so only check now and then whether
+    /// it has been paired again.
+    fn wait(&mut self, rarely: bool) -> Option<Duration> {
+        let lived = self.dialed_at.elapsed();
+        if rarely {
+            self.judged = true;
+            let left = DROPPING_RETRY.saturating_sub(lived);
+            return (!left.is_zero()).then_some(left);
+        }
+        if !self.judged {
+            self.judged = true;
+            self.gap = if lived < Self::SETTLED {
+                next_retry(self.gap)
+            } else {
+                RETRY
+            };
+        }
+        let left = self.gap.saturating_sub(lived);
+        (!left.is_zero()).then_some(left)
+    }
+}
+
+/// Whether this computer may dial `peer` after `down` without a link to
+/// it: the higher key at once, the lower one after [`LOWER_DIAL_AFTER`].
+fn may_dial(me: &DeviceId, peer: &DeviceId, down: Duration) -> bool {
+    me.as_bytes() > peer.as_bytes() || down >= LOWER_DIAL_AFTER
+}
+
+/// A second link to `peer` came up while one is in use: whether the new
+/// one replaces it. Both ends must pick the same connection, so the one
+/// dialed by the higher key wins: the higher computer keeps the link it
+/// dialed, the lower one the link it accepted. Two links made the same way
+/// can't be a race, so the newer one replaces a link that has likely died.
+fn keeps_new_link(me: &DeviceId, peer: &DeviceId, old_dialed: bool, new_dialed: bool) -> bool {
+    if old_dialed == new_dialed {
+        return true;
+    }
+    let wanted_dialed = me.as_bytes() > peer.as_bytes();
+    new_dialed == wanted_dialed
+}
+
+/// The addresses to dial, in order: the one that last worked, those the
+/// computer announces now, then those remembered from earlier.
+fn dial_order(
+    good: Option<SocketAddr>,
+    found: &[SocketAddr],
+    remembered: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let known = found.iter().chain(remembered);
+    let first = good.filter(|g| known.clone().any(|a| a == g));
+    for a in first.iter().chain(known) {
+        if !out.contains(a) {
+            out.push(*a);
+        }
+    }
+    out
+}
+
+fn next_retry(delay: Duration) -> Duration {
+    (delay * 2).min(RETRY_MAX)
+}
+
+/// This computer's IPv4 addresses on home networks. Asks the system which
+/// address it would use to reach a few others (`towards`, plus one address
+/// in each private range and one beyond); nothing is sent.
+fn local_addresses(towards: &[IpAddr]) -> Vec<Ipv4Addr> {
+    let probes = [
+        Ipv4Addr::new(192, 0, 2, 1),
+        Ipv4Addr::new(192, 168, 255, 254),
+        Ipv4Addr::new(172, 31, 255, 254),
+        Ipv4Addr::new(10, 255, 255, 254),
+    ];
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    let targets = towards.iter().copied().chain(probes.map(IpAddr::V4));
+    for target in targets.filter(IpAddr::is_ipv4) {
+        let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+            continue;
+        };
+        if socket.connect((target, 9)).is_err() {
+            continue;
+        }
+        if let Ok(SocketAddr::V4(local)) = socket.local_addr() {
+            let ip = *local.ip();
+            if is_home_address(IpAddr::V4(ip)) && !ip.is_loopback() && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+fn hand_over(
+    conn: PeerConnection,
+    tx: &mpsc::UnboundedSender<Internal>,
+    dialed: bool,
+) -> Result<(), ()> {
     let id = conn.peer();
+    let addr = conn.remote_address();
     let (sender, mut receiver) = conn.split();
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -1666,12 +1988,23 @@ fn hand_over(conn: PeerConnection, tx: &mpsc::UnboundedSender<Internal>) -> Resu
                 // A message from a newer version: the frame was read whole,
                 // so skip it and keep the link.
                 Err(TransportError::Decode(DecodeError::UnknownTag(_))) => {}
-                Err(_) => return,
+                Err(e) => {
+                    if debug_on() {
+                        eprintln!("[hopwyn {}] a link ended: {e:?}", stamp());
+                    }
+                    return;
+                }
             }
         }
     });
-    tx.send(Internal::Connected(id, sender, msg_rx))
-        .map_err(|_| ())
+    tx.send(Internal::Connected {
+        id,
+        sender,
+        rx: msg_rx,
+        addr,
+        dialed,
+    })
+    .map_err(|_| ())
 }
 
 fn debug_on() -> bool {
@@ -1691,4 +2024,101 @@ fn stamp() -> String {
         secs % 60,
         now.subsec_millis()
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn id(n: u8) -> DeviceId {
+        DeviceId::from_bytes([n; 32])
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_higher_key_dials_at_once_and_the_lower_after_a_wait() {
+        let (low, high) = (id(1), id(2));
+        assert!(may_dial(&high, &low, Duration::ZERO));
+        assert!(!may_dial(&low, &high, Duration::ZERO));
+        assert!(!may_dial(&low, &high, Duration::from_secs(5)));
+        assert!(may_dial(&low, &high, LOWER_DIAL_AFTER));
+    }
+
+    /// Each end sees the same two connections, one it dialed and one it
+    /// accepted, in either order. Whatever the order, both must end up on
+    /// the connection the higher key dialed.
+    #[test]
+    fn both_ends_keep_the_link_the_higher_key_dialed() {
+        let (low, high) = (id(1), id(2));
+        for first_dialed in [true, false] {
+            // What each end holds after seeing both links: true if it is
+            // the one that end dialed.
+            let holds = |me: &DeviceId, peer: &DeviceId| {
+                let second_dialed = !first_dialed;
+                if keeps_new_link(me, peer, first_dialed, second_dialed) {
+                    second_dialed
+                } else {
+                    first_dialed
+                }
+            };
+            assert!(holds(&high, &low), "the higher key keeps its own dial");
+            assert!(!holds(&low, &high), "the lower key keeps what it accepted");
+        }
+    }
+
+    #[test]
+    fn a_link_made_the_same_way_replaces_the_old_one() {
+        let (low, high) = (id(1), id(2));
+        for dialed in [true, false] {
+            assert!(keeps_new_link(&low, &high, dialed, dialed));
+            assert!(keeps_new_link(&high, &low, dialed, dialed));
+        }
+    }
+
+    #[test]
+    fn announced_addresses_come_before_remembered_ones_without_repeats() {
+        let found = [addr("192.168.1.20:4242"), addr("192.168.1.21:4242")];
+        let remembered = [addr("10.0.0.7:4242"), addr("192.168.1.20:4242")];
+        assert_eq!(
+            dial_order(None, &found, &remembered),
+            vec![
+                addr("192.168.1.20:4242"),
+                addr("192.168.1.21:4242"),
+                addr("10.0.0.7:4242"),
+            ]
+        );
+        // The address that last worked goes first, if it is still known.
+        assert_eq!(
+            dial_order(Some(addr("10.0.0.7:4242")), &found, &remembered).first(),
+            Some(&addr("10.0.0.7:4242"))
+        );
+        assert_eq!(
+            dial_order(Some(addr("172.16.0.9:4242")), &found, &[]),
+            found.to_vec()
+        );
+        assert!(dial_order(None, &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn retries_slow_down_to_a_limit() {
+        let mut d = RETRY;
+        let mut seen = vec![d.as_secs()];
+        for _ in 0..5 {
+            d = next_retry(d);
+            seen.push(d.as_secs());
+        }
+        assert_eq!(seen, vec![2, 4, 8, 15, 15, 15]);
+    }
+
+    #[test]
+    fn only_home_addresses_are_offered() {
+        for ip in local_addresses(&[]) {
+            assert!(is_home_address(IpAddr::V4(ip)));
+            assert!(!ip.is_loopback());
+        }
+    }
 }
