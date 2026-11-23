@@ -1,3 +1,16 @@
+hopwyn (0.3.0-0ppa1) resolute; urgency=medium
+
+  * Reconnects after a change of network: each device remembers where it
+    last reached the other, and either one may start the connection.
+  * Add computer shows this computer's address, to type on a device that
+    can't find it on networks that hide devices from each other.
+  * A device that keeps dropping the connection is shown as such and
+    retried only now and then, instead of reconnecting in a loop.
+  * The status card says when it is waiting for input sharing to be
+    allowed, instead of "Ready".
+
+ -- Dhivakar R (Dhiva-Labs) <dhivakar1010@gmail.com>  Tue, 24 Nov 2026 03:24:13 +0530
+
 hopwyn (0.2.0-0ppa1) resolute; urgency=medium
 
   * Asks for input permissions only when needed, or once at startup, as

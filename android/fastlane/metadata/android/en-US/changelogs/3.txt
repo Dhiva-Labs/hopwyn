@@ -1,0 +1,1 @@
+Connecting is easier: Hopwyn reconnects after you change Wi-Fi, and can pair by typing the computer's address when a network hides devices. Pairing is now one clear screen, a new Phone control screen walks you through the Android settings, and Hopwyn uses less battery in the background.
