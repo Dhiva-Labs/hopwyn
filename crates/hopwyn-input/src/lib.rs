@@ -11,11 +11,23 @@
 //! codes here; keys without a mapping are dropped rather than guessed.
 
 pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod clipboard;
 pub mod keymap;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]
 pub mod linux_capture;
+#[cfg(target_os = "linux")]
+mod mutter;
+
+/// Whether this desktop lets Hopwyn share input (and the clipboard)
+/// without showing a permission dialog. True on GNOME outside a sandbox;
+/// elsewhere the desktop's portal asks.
+#[cfg(target_os = "linux")]
+pub fn no_permission_dialog() -> bool {
+    mutter::available()
+}
 
 /// Turns `wayland:<exported handle>` or `x11:<hex xid>` into the window
 /// the desktop's permission dialog should sit on top of.

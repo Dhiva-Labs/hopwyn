@@ -63,6 +63,9 @@ pub struct Settings {
     /// and other computers can't take control of this one.
     pub sharing: bool,
     pub ask: AskWhen,
+    /// Send text copied here to paired devices, and take theirs. Off
+    /// unless the user turns it on.
+    pub clipboard: bool,
 }
 
 impl Default for Settings {
@@ -70,6 +73,7 @@ impl Default for Settings {
         Self {
             sharing: true,
             ask: AskWhen::Online,
+            clipboard: false,
         }
     }
 }
@@ -147,6 +151,7 @@ impl Store {
         for line in text.lines() {
             match line.trim().split_once('=') {
                 Some(("sharing", v)) => s.sharing = v.trim() != "off",
+                Some(("clipboard", v)) => s.clipboard = v.trim() == "on",
                 Some(("ask", v)) => {
                     s.ask = if v.trim() == "startup" {
                         AskWhen::Startup
@@ -162,12 +167,13 @@ impl Store {
 
     pub fn save_settings(&self, s: Settings) -> Result<(), String> {
         let text = format!(
-            "sharing={}\nask={}\n",
+            "sharing={}\nask={}\nclipboard={}\n",
             if s.sharing { "on" } else { "off" },
             match s.ask {
                 AskWhen::Online => "online",
                 AskWhen::Startup => "startup",
-            }
+            },
+            if s.clipboard { "on" } else { "off" }
         );
         write_private(&self.dir.join("settings"), text.as_bytes())
     }
@@ -477,6 +483,7 @@ mod tests {
         let off = Settings {
             sharing: false,
             ask: AskWhen::Startup,
+            clipboard: true,
         };
         s.save_settings(off).unwrap();
         assert_eq!(s.settings(), off);

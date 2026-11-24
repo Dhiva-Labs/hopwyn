@@ -1,6 +1,6 @@
 # Hopwyn privacy policy
 
-_Last updated: 24 November 2026_
+_Last updated: 25 November 2026_
 
 Hopwyn lets the computers and phones in your home share one mouse and keyboard. This policy covers the Hopwyn apps for Android, Linux, Windows and macOS, published by Dhiva Labs.
 
@@ -18,7 +18,11 @@ Uninstalling Hopwyn, or clearing its storage, deletes all of the above.
 
 ## What goes over your network
 
-Paired devices talk to each other directly over your home network. They send pointer movements, clicks, scrolling, key presses and typed text, only while you are using one device to control another. This traffic is end-to-end encrypted and authenticated with the keys you checked when pairing. It never passes through a Dhiva Labs server, because there isn't one.
+Paired devices talk to each other directly over your home network. They send pointer movements, clicks, scrolling, key presses and typed text, only while you are using one device to control another, and copied text if you turn clipboard sharing on. This traffic is end-to-end encrypted and authenticated with the keys you checked when pairing. It never passes through a Dhiva Labs server, because there isn't one.
+
+## Clipboard (optional)
+
+Clipboard sharing is off until you turn it on in Settings, on each device. With it on, text you copy on one device is sent to your other paired devices that have it on too, over the same encrypted link, and placed on their clipboard. It is not stored by Hopwyn and never leaves your network. Only plain text is shared, and copies that a password manager marks as secret are left alone. On Android, Hopwyn can read the clipboard only while its own screen is open.
 
 ## Accessibility service (Android)
 

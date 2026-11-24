@@ -169,40 +169,220 @@ fn portal(e: ashpd::Error) -> InputError {
     InputError::Portal(e.to_string())
 }
 
-/// Moves the barriers (to new edges, or after the screens changed). The
-/// desktop only accepts new barriers while capture is off, so: disable,
-/// set, enable. On failure capture keeps running with the old barriers
-/// (and logs why) rather than ending.
-async fn rearm(
-    ic: &InputCapture,
-    session: &Session<InputCapture>,
-    edges: &[Edge],
-    ids: &mut HashMap<u32, Edge>,
-) -> Option<Vec<Rect>> {
-    if let Err(e) = ic.disable(session, DisableOptions::default()).await {
-        trace(&format!("disable failed: {e}"));
-    }
-    let rects = match zones_and_barriers(ic, session, edges, ids).await {
-        Ok(r) => Some(r),
-        Err(e) => {
-            trace(&format!("setting barriers failed: {e}"));
-            None
-        }
-    };
-    match ic.enable(session, EnableOptions::default()).await {
-        Ok(_) => trace("enabled"),
-        Err(e) => trace(&format!("enable failed: {e}")),
-    }
-    rects
+/// What the desktop tells a capture session.
+enum Sig {
+    /// The pointer crossed a barrier: which one, the id to release with,
+    /// and where the cursor was.
+    Activated {
+        barrier: Option<u32>,
+        id: u32,
+        cursor: Option<(f32, f32)>,
+    },
+    Deactivated,
+    Disabled,
+    ZonesChanged,
+    /// The desktop ended the session.
+    Closed,
 }
 
-async fn zones_and_barriers(
+type Sigs<'a> = std::pin::Pin<Box<dyn futures_util::Stream<Item = Sig> + 'a>>;
+
+/// The capture session, through GNOME's own interface or the portal.
+enum Desk<'a> {
+    Mutter(crate::mutter::Capture),
+    Portal {
+        ic: &'a InputCapture,
+        session: Session<InputCapture>,
+    },
+}
+
+impl<'a> Desk<'a> {
+    async fn connect_to_eis(&self) -> Result<std::os::fd::OwnedFd, InputError> {
+        match self {
+            Self::Mutter(m) => m.connect_to_eis().await,
+            Self::Portal { ic, session } => ic
+                .connect_to_eis(session, ConnectToEISOptions::default())
+                .await
+                .map_err(portal),
+        }
+    }
+
+    /// One stream of everything the desktop reports about the session.
+    async fn signals(&self) -> Result<Sigs<'a>, InputError> {
+        use futures_util::stream::select;
+        match self {
+            Self::Mutter(m) => {
+                let activated = m.signal("Activated").await?.map(|msg| {
+                    match msg.body().deserialize::<(u32, u32, (f64, f64))>() {
+                        #[allow(clippy::cast_possible_truncation)]
+                        Ok((barrier, id, (x, y))) => Sig::Activated {
+                            barrier: Some(barrier),
+                            id,
+                            cursor: Some((x as f32, y as f32)),
+                        },
+                        Err(_) => Sig::Activated {
+                            barrier: None,
+                            id: 0,
+                            cursor: None,
+                        },
+                    }
+                });
+                let deactivated = m.signal("Deactivated").await?.map(|_| Sig::Deactivated);
+                let disabled = m.signal("Disabled").await?.map(|_| Sig::Disabled);
+                let zones = m.signal("ZonesChanged").await?.map(|_| Sig::ZonesChanged);
+                let closed = m.signal("Closed").await?.map(|_| Sig::Closed);
+                Ok(Box::pin(select(
+                    select(activated, deactivated),
+                    select(select(disabled, zones), closed),
+                )))
+            }
+            Self::Portal { ic, .. } => {
+                let ic: &'a InputCapture = ic;
+                let activated =
+                    ic.receive_activated()
+                        .await
+                        .map_err(portal)?
+                        .map(|a| Sig::Activated {
+                            barrier: match a.barrier_id() {
+                                Some(ActivatedBarrier::Barrier(b)) => Some(b.get()),
+                                _ => None,
+                            },
+                            id: a.activation_id().unwrap_or(0),
+                            cursor: a.cursor_position(),
+                        });
+                let deactivated = ic
+                    .receive_deactivated()
+                    .await
+                    .map_err(portal)?
+                    .map(|_| Sig::Deactivated);
+                let disabled = ic
+                    .receive_disabled()
+                    .await
+                    .map_err(portal)?
+                    .map(|_| Sig::Disabled);
+                let zones = ic
+                    .receive_zones_changed()
+                    .await
+                    .map_err(portal)?
+                    .map(|_| Sig::ZonesChanged);
+                Ok(Box::pin(select(
+                    select(activated, deactivated),
+                    select(disabled, zones),
+                )))
+            }
+        }
+    }
+
+    async fn enable(&self) -> Result<(), InputError> {
+        match self {
+            Self::Mutter(m) => m.enable().await,
+            Self::Portal { ic, session } => ic
+                .enable(session, EnableOptions::default())
+                .await
+                .map(|_| ())
+                .map_err(portal),
+        }
+    }
+
+    async fn disable(&self) -> Result<(), InputError> {
+        match self {
+            Self::Mutter(m) => m.disable().await,
+            Self::Portal { ic, session } => ic
+                .disable(session, DisableOptions::default())
+                .await
+                .map(|_| ())
+                .map_err(portal),
+        }
+    }
+
+    /// Gives the cursor back at `at`, ending activation `id`.
+    async fn release(&self, id: u32, at: Option<(f64, f64)>) {
+        match self {
+            Self::Mutter(m) => {
+                let _ = m.release(at).await;
+            }
+            Self::Portal { ic, session } => {
+                let opts = ReleaseOptions::default()
+                    .set_activation_id(id)
+                    .set_cursor_position(at);
+                let _ = ic.release(session, opts).await;
+            }
+        }
+    }
+
+    async fn close(self) {
+        match self {
+            Self::Mutter(m) => m.close().await,
+            Self::Portal { session, .. } => {
+                let _ = session.close().await;
+            }
+        }
+    }
+
+    /// Moves the barriers (to new edges, or after the screens changed).
+    /// The desktop only accepts new barriers while capture is off, so:
+    /// disable, set, enable. On failure capture keeps running with the old
+    /// barriers (and logs why) rather than ending.
+    async fn rearm(&self, edges: &[Edge], ids: &mut HashMap<u32, Edge>) -> Option<Vec<Rect>> {
+        if let Err(e) = self.disable().await {
+            trace(&format!("disable failed: {e}"));
+        }
+        let rects = match self.zones_and_barriers(edges, ids).await {
+            Ok(r) => Some(r),
+            Err(e) => {
+                trace(&format!("setting barriers failed: {e}"));
+                None
+            }
+        };
+        match self.enable().await {
+            Ok(()) => trace("enabled"),
+            Err(e) => trace(&format!("enable failed: {e}")),
+        }
+        rects
+    }
+
+    /// Reads the screens and puts a barrier on each of `edges`, noting in
+    /// `ids` which barrier belongs to which edge.
+    async fn zones_and_barriers(
+        &self,
+        edges: &[Edge],
+        ids: &mut HashMap<u32, Edge>,
+    ) -> Result<Vec<Rect>, InputError> {
+        trace("get zones");
+        match self {
+            Self::Mutter(m) => {
+                let (serial, rects) = m.zones().await?;
+                m.clear_barriers().await?;
+                ids.clear();
+                for edge in edges {
+                    for line in edge_barriers(&rects, *edge) {
+                        let id = m.add_barrier(serial, line).await?;
+                        ids.insert(id, *edge);
+                    }
+                }
+                if ids.is_empty() {
+                    return Err(InputError::Portal(
+                        "no screen edge to place a barrier on".into(),
+                    ));
+                }
+                trace(&format!(
+                    "set {} barrier(s) on {} zone(s)",
+                    ids.len(),
+                    rects.len()
+                ));
+                Ok(rects)
+            }
+            Self::Portal { ic, session } => portal_barriers(ic, session, edges, ids).await,
+        }
+    }
+}
+
+async fn portal_barriers(
     ic: &InputCapture,
     session: &Session<InputCapture>,
     edges: &[Edge],
     ids: &mut HashMap<u32, Edge>,
 ) -> Result<Vec<Rect>, InputError> {
-    trace("get zones");
     let zones = ic
         .zones(session, GetZonesOptions::default())
         .await
@@ -279,59 +459,75 @@ async fn run(
     ready: Ready,
     layout: Arc<Mutex<Vec<Rect>>>,
 ) {
-    let ic = match InputCapture::new().await {
-        Ok(ic) => ic,
-        Err(e) => {
-            let _ = ready.send(Err(portal(e)));
-            return;
+    // GNOME's own interface needs no permission dialog; the portal (other
+    // desktops, sandboxes) asks each time on GNOME.
+    let mutter = crate::mutter::Capture::open().await;
+    let ic = if mutter.is_some() {
+        None
+    } else {
+        match InputCapture::new().await {
+            Ok(ic) => Some(ic),
+            Err(e) => {
+                let _ = ready.send(Err(portal(e)));
+                return;
+            }
         }
     };
     let parent = crate::parent_window(parent.as_deref());
     let mut ids: HashMap<u32, Edge> = HashMap::new();
     let setup = async {
-        // This step waits for the user to answer GNOME's permission dialog.
-        trace("create_session (waiting for the permission dialog)");
-        let caps = Capabilities::Keyboard | Capabilities::Pointer;
-        let create = async {
-            if ic.version() >= 2 {
-                // Version 2 can remember the answer, so later launches skip the dialog.
-                let session = ic
-                    .create_session2(CreateSession2Options::default())
-                    .await
-                    .map_err(portal)?;
-                let started = ic
-                    .start(
-                        &session,
-                        parent.as_ref(),
-                        StartOptions::default()
-                            .set_capabilities(caps)
-                            .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                            .set_restore_token(token.clone()),
-                    )
-                    .await
-                    .map_err(portal)?
-                    .response()
-                    .map_err(portal)?;
-                Ok::<_, InputError>((session, started.restore_token().map(str::to_owned)))
-            } else {
-                let (session, _caps) = ic
-                    .create_session(
-                        parent.as_ref(),
-                        CreateSessionOptions::default().set_capabilities(caps),
-                    )
-                    .await
-                    .map_err(portal)?;
-                Ok((session, None))
+        let (desk, new_token) = match (mutter, ic.as_ref()) {
+            (Some(m), _) => {
+                trace("using GNOME's capture directly (no permission dialog)");
+                (Desk::Mutter(m), None)
             }
+            (None, Some(ic)) => {
+                // This step waits for the user to answer the permission dialog.
+                trace("create_session (waiting for the permission dialog)");
+                let caps = Capabilities::Keyboard | Capabilities::Pointer;
+                let create = async {
+                    if ic.version() >= 2 {
+                        // Version 2 can remember the answer, so later launches skip the dialog.
+                        let session = ic
+                            .create_session2(CreateSession2Options::default())
+                            .await
+                            .map_err(portal)?;
+                        let started = ic
+                            .start(
+                                &session,
+                                parent.as_ref(),
+                                StartOptions::default()
+                                    .set_capabilities(caps)
+                                    .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                                    .set_restore_token(token.clone()),
+                            )
+                            .await
+                            .map_err(portal)?
+                            .response()
+                            .map_err(portal)?;
+                        Ok::<_, InputError>((session, started.restore_token().map(str::to_owned)))
+                    } else {
+                        let (session, _caps) = ic
+                            .create_session(
+                                parent.as_ref(),
+                                CreateSessionOptions::default().set_capabilities(caps),
+                            )
+                            .await
+                            .map_err(portal)?;
+                        Ok((session, None))
+                    }
+                };
+                let (session, new_token) = tokio::time::timeout(PERMISSION_TIMEOUT, create)
+                    .await
+                    .map_err(|_| {
+                        InputError::Portal("the permission dialog was not answered".into())
+                    })??;
+                (Desk::Portal { ic, session }, new_token)
+            }
+            (None, None) => return Err(InputError::Closed),
         };
-        let (session, new_token) = tokio::time::timeout(PERMISSION_TIMEOUT, create)
-            .await
-            .map_err(|_| InputError::Portal("the permission dialog was not answered".into()))??;
         trace("connect_to_eis");
-        let fd = ic
-            .connect_to_eis(&session, ConnectToEISOptions::default())
-            .await
-            .map_err(portal)?;
+        let fd = desk.connect_to_eis().await?;
         let context =
             ei::Context::new(UnixStream::from(fd)).map_err(|e| InputError::Ei(e.to_string()))?;
         trace("ei handshake");
@@ -340,39 +536,14 @@ async fn run(
             .await
             .map_err(|e| InputError::Ei(e.to_string()))?;
         trace("subscribe to signals");
-        let activated = ic.receive_activated().await.map_err(portal)?;
-        let deactivated = ic.receive_deactivated().await.map_err(portal)?;
-        let disabled = ic.receive_disabled().await.map_err(portal)?;
-        let zones_changed = ic.receive_zones_changed().await.map_err(portal)?;
-        let rects = zones_and_barriers(&ic, &session, &edges, &mut ids).await?;
+        let signals = desk.signals().await?;
+        let rects = desk.zones_and_barriers(&edges, &mut ids).await?;
         trace("enable");
-        ic.enable(&session, EnableOptions::default())
-            .await
-            .map_err(portal)?;
-        Ok::<_, InputError>((
-            session,
-            conn,
-            events,
-            activated,
-            deactivated,
-            disabled,
-            zones_changed,
-            rects,
-            new_token,
-        ))
+        desk.enable().await?;
+        Ok::<_, InputError>((desk, conn, events, signals, rects, new_token))
     };
 
-    let (
-        session,
-        conn,
-        events,
-        activated,
-        deactivated,
-        disabled,
-        zones_changed,
-        mut rects,
-        new_token,
-    ) = match setup.await {
+    let (desk, conn, events, mut signals, mut rects, new_token) = match setup.await {
         Ok(v) => v,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -385,7 +556,7 @@ async fn run(
     if ready.send(Ok(new_token)).is_err() {
         return;
     }
-    tokio::pin!(events, activated, deactivated, disabled, zones_changed);
+    tokio::pin!(events);
 
     let mut translator = Translator::new();
     // (activation id, edge hit, position along it) while captured.
@@ -398,50 +569,45 @@ async fn run(
         let mut release_now: Option<ReleaseReason> = None;
         let mut release_pos: Option<f32> = None;
         tokio::select! {
-            a = activated.next() => {
-                let Some(a) = a else { break };
-                let by_id = match a.barrier_id() {
-                    Some(ActivatedBarrier::Barrier(b)) => ids.get(&b.get()).copied(),
-                    _ => None,
-                };
-                let first = edges.first().copied().unwrap_or(Edge::Right);
-                let edge = by_id
-                    .or_else(|| a.cursor_position().and_then(|c| nearest_edge(&rects, &edges, c)))
-                    .unwrap_or(first);
-                let position = a.cursor_position().map_or(0.5, |c| edge_position(&rects, edge, c));
-                let id = a.activation_id().unwrap_or(0);
-                active = Some((id, edge, position));
-                if !send(CaptureEvent::Activated { edge, position }) { break }
-            }
-            d = deactivated.next() => {
-                if d.is_none() { break }
-                if active.take().is_some() {
+            sig = signals.next() => match sig {
+                None | Some(Sig::Closed) => break,
+                Some(Sig::Activated { barrier, id, cursor }) => {
+                    let by_id = barrier.and_then(|b| ids.get(&b).copied());
+                    let first = edges.first().copied().unwrap_or(Edge::Right);
+                    let edge = by_id
+                        .or_else(|| cursor.and_then(|c| nearest_edge(&rects, &edges, c)))
+                        .unwrap_or(first);
+                    let position = cursor.map_or(0.5, |c| edge_position(&rects, edge, c));
+                    active = Some((id, edge, position));
+                    if !send(CaptureEvent::Activated { edge, position }) { break }
+                }
+                Some(Sig::Deactivated) => {
+                    if active.take().is_some() {
+                        for ev in translator.release_all() {
+                            let _ = send(CaptureEvent::Input(ev));
+                        }
+                        if !send(CaptureEvent::Released(ReleaseReason::Desktop)) { break }
+                    }
+                }
+                Some(Sig::Disabled) => {
+                    trace("disabled by the desktop");
+                    // Not fatal: the desktop pauses capture (for example while a
+                    // remote-control session is open); `enable` resumes it.
+                    active = None;
                     for ev in translator.release_all() {
                         let _ = send(CaptureEvent::Input(ev));
                     }
-                    if !send(CaptureEvent::Released(ReleaseReason::Desktop)) { break }
+                    if !send(CaptureEvent::Disabled) { break }
                 }
-            }
-            d = disabled.next() => {
-                if d.is_none() { break }
-                trace("disabled by the desktop");
-                // Not fatal: the desktop pauses capture (for example while a
-                // remote-control session is open); `enable` resumes it.
-                active = None;
-                for ev in translator.release_all() {
-                    let _ = send(CaptureEvent::Input(ev));
-                }
-                if !send(CaptureEvent::Disabled) { break }
-            }
-            z = zones_changed.next() => {
-                if z.is_none() { break }
-                if let Some(r) = rearm(&ic, &session, &edges, &mut ids).await {
-                    rects = r;
-                    if let Ok(mut l) = layout.lock() {
-                        l.clone_from(&rects);
+                Some(Sig::ZonesChanged) => {
+                    if let Some(r) = desk.rearm(&edges, &mut ids).await {
+                        rects = r;
+                        if let Ok(mut l) = layout.lock() {
+                            l.clone_from(&rects);
+                        }
                     }
                 }
-            }
+            },
             cmd = rx.recv() => match cmd {
                 Some(Command::Release(pos)) => {
                     release_now = Some(ReleaseReason::Requested);
@@ -450,7 +616,7 @@ async fn run(
                 Some(Command::SetEdges(new_edges)) => {
                     trace("move barriers");
                     edges = new_edges;
-                    if let Some(r) = rearm(&ic, &session, &edges, &mut ids).await {
+                    if let Some(r) = desk.rearm(&edges, &mut ids).await {
                         rects = r;
                         if let Ok(mut l) = layout.lock() {
                             l.clone_from(&rects);
@@ -459,7 +625,7 @@ async fn run(
                 }
                 Some(Command::Enable) => {
                     trace("enable");
-                    if let Err(e) = ic.enable(&session, EnableOptions::default()).await {
+                    if let Err(e) = desk.enable().await {
                         trace(&format!("enable failed: {e}"));
                     }
                 }
@@ -517,10 +683,8 @@ async fn run(
                 let _ = send(CaptureEvent::Input(ev));
             }
             let position = release_pos.unwrap_or(hit);
-            let opts = ReleaseOptions::default()
-                .set_activation_id(id)
-                .set_cursor_position(release_point(&rects, edge, position, RELEASE_INSET));
-            let _ = ic.release(&session, opts).await;
+            desk.release(id, release_point(&rects, edge, position, RELEASE_INSET))
+                .await;
             if !send(CaptureEvent::Released(reason)) {
                 break;
             }
@@ -529,10 +693,9 @@ async fn run(
 
     // Never leave the user without a cursor: release before tearing down.
     if let Some((id, edge, position)) = active {
-        let opts = ReleaseOptions::default()
-            .set_activation_id(id)
-            .set_cursor_position(release_point(&rects, edge, position, RELEASE_INSET));
-        let _ = ic.release(&session, opts).await;
+        desk.release(id, release_point(&rects, edge, position, RELEASE_INSET))
+            .await;
     }
-    let _ = session.close().await;
+    drop(signals);
+    desk.close().await;
 }

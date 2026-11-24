@@ -142,6 +142,18 @@ fun SettingsScreen(
                 }
             }
 
+            item { Heading("Clipboard") }
+            item {
+                Panel {
+                    SwitchRow(
+                        title = "Share the clipboard",
+                        text = "Text copied on a paired computer arrives here. Text copied here is sent when you open Hopwyn. Turn it on on the computer too.",
+                        checked = prefs.shareClipboard,
+                        onChange = prefs::updateShareClipboard,
+                    )
+                }
+            }
+
             item { Heading("This phone") }
             item {
                 Panel {

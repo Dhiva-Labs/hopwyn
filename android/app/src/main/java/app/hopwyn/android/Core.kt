@@ -1,5 +1,7 @@
 package app.hopwyn.android
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -58,6 +60,8 @@ object Core {
         startError = Native.nativeStart(app.filesDir.absolutePath, deviceName(app))
         started = true
         if (startError == null) {
+            appContext = app
+            Native.nativeSetClipboard(Prefs.get(app).shareClipboard)
             main.post { watchNetwork(app) }
             readEvents()
         }
@@ -95,8 +99,44 @@ object Core {
         }
     }
 
+    private var appContext: Context? = null
+    // The newest copied text that went either way, and when the phone's
+    // clipboard was last read, so nothing is sent twice or sent back.
+    private var lastClip = ""
+    private var lastClipTime = 0L
+
+    /** Puts text copied on a computer onto the phone's clipboard. */
+    private fun paste(text: String) {
+        val app = appContext ?: return
+        if (text.isEmpty() || text == lastClip || !Prefs.get(app).shareClipboard) return
+        lastClip = text
+        val clipboard = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        runCatching { clipboard.setPrimaryClip(ClipData.newPlainText("Hopwyn", text)) }
+        lastClipTime = runCatching { clipboard.primaryClipDescription?.timestamp }.getOrNull() ?: lastClipTime
+    }
+
+    /**
+     * Sends what was copied on the phone to paired computers. Android only
+     * lets the app on screen read the clipboard, so this runs when one of
+     * Hopwyn's screens gets focus. The clipboard is read only when it holds
+     * something new (Android tells the user each time an app reads it).
+     */
+    fun sendCopied(context: Context) {
+        if (!started || startError != null || !Prefs.get(context).shareClipboard) return
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val about = runCatching { clipboard.primaryClipDescription }.getOrNull() ?: return
+        if (about.timestamp == lastClipTime || about.label == "Hopwyn") return
+        if (!about.hasMimeType("text/*")) return
+        lastClipTime = about.timestamp
+        val text = runCatching { clipboard.primaryClip?.getItemAt(0)?.text?.toString() }.getOrNull()
+        if (text.isNullOrEmpty() || text == lastClip) return
+        lastClip = text
+        Native.nativeCopied(text)
+    }
+
     private fun deliver(line: String) {
         when (val kind = line.substringBefore('\u001f')) {
+            "clipboard" -> return paste(line.substringAfter('\u001f', ""))
             "ready", "partners", "nearby", "controlling" -> latest[kind] = line
             "pairing-open", "pairing-confirm" -> latest["pairing"] = line
             "pairing-done", "pairing-failed", "pairing-closed" -> latest.remove("pairing")

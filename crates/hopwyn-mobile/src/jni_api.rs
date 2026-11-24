@@ -130,6 +130,24 @@ pub extern "system" fn Java_app_hopwyn_android_Native_nativeNetworkChanged<'l>(
     send(Command::NetworkChanged);
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_hopwyn_android_Native_nativeSetClipboard<'l>(
+    _env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    on: jboolean,
+) {
+    send(Command::SetClipboard(on != 0));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_app_hopwyn_android_Native_nativeCopied<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    text: JString<'l>,
+) {
+    send(Command::Copied(string(&mut env, &text)));
+}
+
 fn with_id(
     env: &mut JNIEnv<'_>,
     id: &JString<'_>,

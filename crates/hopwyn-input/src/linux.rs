@@ -97,6 +97,18 @@ async fn run(
     let parent = crate::parent_window(parent.as_deref());
     let portal = |e: ashpd::Error| InputError::Portal(e.to_string());
     let setup = async {
+        // GNOME's own interface needs no permission dialog; the portal
+        // (other desktops, sandboxes) asks, and may remember the answer.
+        if let Some(desktop) = crate::mutter::Desktop::open().await {
+            let fd = desktop.connect_to_eis().await?;
+            let context = ei::Context::new(UnixStream::from(fd))
+                .map_err(|e| InputError::Ei(e.to_string()))?;
+            let (conn, events) = context
+                .handshake_tokio("hopwyn", ei::handshake::ContextType::Sender)
+                .await
+                .map_err(|e| InputError::Ei(e.to_string()))?;
+            return Ok((Held::Mutter(desktop), conn, events, None));
+        }
         let rd = RemoteDesktop::new().await.map_err(portal)?;
         let session = rd
             .create_session(CreateSessionOptions::default())
@@ -128,10 +140,10 @@ async fn run(
             .handshake_tokio("hopwyn", ei::handshake::ContextType::Sender)
             .await
             .map_err(|e| InputError::Ei(e.to_string()))?;
-        Ok::<_, InputError>((rd, session, conn, events, new_token))
+        Ok::<_, InputError>((Held::Portal(rd, session), conn, events, new_token))
     };
 
-    let (_rd, session, conn, mut events, new_token) = match setup.await {
+    let (held, conn, mut events, new_token) = match setup.await {
         Ok(v) => v,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -185,7 +197,18 @@ async fn run(
         }
     }
     // End the remote session explicitly so the desktop drops it at once.
-    let _ = session.close().await;
+    match held {
+        Held::Mutter(desktop) => desktop.close().await,
+        Held::Portal(_rd, session) => {
+            let _ = session.close().await;
+        }
+    }
+}
+
+/// The session behind the libei connection, kept open while it is used.
+enum Held {
+    Mutter(crate::mutter::Desktop),
+    Portal(RemoteDesktop, ashpd::desktop::Session<RemoteDesktop>),
 }
 
 struct State {

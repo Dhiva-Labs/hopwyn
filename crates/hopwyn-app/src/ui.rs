@@ -146,6 +146,7 @@ struct Ui {
     /// The window should hand itself to the service once it's on screen.
     export_pending: Cell<bool>,
     sharing_row: adw::SwitchRow,
+    clipboard_row: adw::SwitchRow,
     ask_row: adw::ComboRow,
     /// Set while the rows are updated from the service, so that doesn't
     /// echo back as a command.
@@ -230,8 +231,15 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         .subtitle("When needed: only once a paired computer is online. GNOME forgets the answer at logout.")
         .model(&gtk::StringList::new(&["When needed", "At startup"]))
         .build();
+    // Nothing to ask where the desktop shares input without a dialog.
+    ask_row.set_visible(!hopwyn_input::no_permission_dialog());
+    let clipboard_row = adw::SwitchRow::builder()
+        .title("Share the clipboard")
+        .subtitle("Text you copy is sent to your paired devices that have this on too. Copies a password manager marks as secret are not.")
+        .build();
     sharing_group.add(&sharing_row);
     sharing_group.add(&ask_row);
+    sharing_group.add(&clipboard_row);
 
     // Paired computers, with a picture of where each one sits.
     let partner_group = adw::PreferencesGroup::builder()
@@ -374,6 +382,7 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         input: Cell::new(InputState::Waiting),
         export_pending: Cell::new(false),
         sharing_row: sharing_row.clone(),
+        clipboard_row: clipboard_row.clone(),
         ask_row: ask_row.clone(),
         updating: Cell::new(false),
     });
@@ -432,6 +441,14 @@ fn build(app: &adw::Application) -> adw::ApplicationWindow {
         ui.sharing_row.connect_active_notify(move |row| {
             if !ui2.updating.get() {
                 let _ = ui2.cmd.send(Command::SetSharing(row.is_active()));
+            }
+        });
+    }
+    {
+        let ui2 = ui.clone();
+        ui.clipboard_row.connect_active_notify(move |row| {
+            if !ui2.updating.get() {
+                let _ = ui2.cmd.send(Command::SetClipboard(row.is_active()));
             }
         });
     }
@@ -524,6 +541,7 @@ impl Ui {
             UiEvent::Settings(settings) => {
                 self.updating.set(true);
                 self.sharing_row.set_active(settings.sharing);
+                self.clipboard_row.set_active(settings.clipboard);
                 self.ask_row.set_selected(match settings.ask {
                     AskWhen::Online => 0,
                     AskWhen::Startup => 1,

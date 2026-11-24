@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use hopwyn_discovery::{Discovery, DiscoveryEvent};
 use hopwyn_pair::{DeviceId, Identity, PairedPeer};
-use hopwyn_proto::{Button, DecodeError, Edge, Message};
+use hopwyn_proto::{Button, DecodeError, Edge, MAX_CLIPBOARD_TEXT, Message};
 use hopwyn_transport::{
     Node, PeerConnection, PeerSender, TransportError, TrustStore, is_home_address,
 };
@@ -73,6 +73,10 @@ pub enum Command {
     SetAddress(DeviceId, String),
     /// The phone joined, left or changed network.
     NetworkChanged,
+    /// Whether the user shares the clipboard with paired computers.
+    SetClipboard(bool),
+    /// Text was copied on the phone.
+    Copied(String),
     /// Start driving this paired computer.
     Control(DeviceId),
     /// Stop driving; the computer gets its own mouse back.
@@ -201,6 +205,8 @@ pub enum Event {
     PairingClosed,
     /// Driving this computer now, or none.
     Controlling(Option<DeviceId>),
+    /// Text copied on a paired computer, to put on the phone's clipboard.
+    Clipboard(String),
     Error(String),
 }
 
@@ -284,6 +290,9 @@ impl Event {
                     id.as_ref().map(hex).unwrap_or_default()
                 )
             }
+            // The text goes as it is, line breaks and all: it is the last
+            // field, so the app takes everything after the first separator.
+            Event::Clipboard(text) => format!("clipboard{UNIT}{text}"),
             Event::Error(e) => format!("error{UNIT}{}", clean(e)),
         }
     }
@@ -650,6 +659,8 @@ struct Core {
     pairing: Option<Pairing>,
     tried: HashSet<(DeviceId, String)>,
     controlling: Option<DeviceId>,
+    /// The user shares the clipboard: send copies, accept theirs.
+    clipboard: bool,
     carry: (f32, f32),
     tx: mpsc::UnboundedSender<Internal>,
     rx: mpsc::UnboundedReceiver<Internal>,
@@ -809,6 +820,7 @@ impl Core {
             pairing: None,
             tried: HashSet::new(),
             controlling: None,
+            clipboard: false,
             carry: (0.0, 0.0),
             tx,
             rx,
@@ -953,6 +965,11 @@ impl Core {
                     return;
                 }
                 match m {
+                    Message::ClipboardText { text } => {
+                        if self.clipboard {
+                            self.emit(Event::Clipboard(text));
+                        }
+                    }
                     Message::Enter { edge, position } => {
                         self.driven_enter(id, edge, position).await
                     }
@@ -1115,6 +1132,16 @@ impl Core {
                 Err(e) => self.emit(Event::Error(e)),
             },
             Command::NetworkChanged => self.network_changed().await,
+            Command::SetClipboard(on) => self.clipboard = on,
+            Command::Copied(text) => {
+                if self.clipboard && !text.is_empty() && text.len() <= MAX_CLIPBOARD_TEXT {
+                    let msg = Message::ClipboardText { text };
+                    let ids: Vec<DeviceId> = self.links.keys().copied().collect();
+                    for id in ids {
+                        self.send_to(id, &msg).await;
+                    }
+                }
+            }
             Command::Control(id) => {
                 if self.controlling == Some(id) {
                     return;
@@ -1703,6 +1730,11 @@ mod tests {
             "pairing-confirm\u{1f}Desk\u{1f}123456"
         );
         assert_eq!(Event::Controlling(None).to_line(), "controlling\u{1f}");
+        // Clipboard text keeps its line breaks.
+        assert_eq!(
+            Event::Clipboard("a\nb".into()).to_line(),
+            "clipboard\u{1f}a\nb"
+        );
     }
 
     #[test]

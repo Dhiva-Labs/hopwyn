@@ -25,6 +25,12 @@ object Native {
 
     /** The phone joined, left or changed network. */
     external fun nativeNetworkChanged()
+
+    /** Whether the user shares the clipboard with paired computers. */
+    external fun nativeSetClipboard(on: Boolean)
+
+    /** Text was copied on the phone: send it to paired computers. */
+    external fun nativeCopied(text: String)
     external fun nativeControl(id: String)
     external fun nativeRelease()
     external fun nativeForget(id: String)

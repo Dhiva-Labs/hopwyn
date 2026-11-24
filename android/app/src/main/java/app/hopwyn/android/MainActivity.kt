@@ -77,6 +77,12 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Android lets an app read the clipboard only once it has focus.
+        if (hasFocus) Core.sendCopied(this)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = Prefs.get(this)

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use hopwyn_core::{Action, Config, Engine, Input, State};
 use hopwyn_discovery::{Discovery, DiscoveryEvent};
 use hopwyn_input::capture::CaptureEvent;
+use hopwyn_input::clipboard::LinuxClipboard;
 use hopwyn_input::linux::LinuxEmulator;
 use hopwyn_input::linux_capture::LinuxCapture;
 use hopwyn_input::{InputError, InputEvent};
@@ -34,6 +35,11 @@ const LINK_PORT: u16 = 4242;
 /// Test mode: `HOPWYN_NO_INPUT=1` skips the desktop's input portals, so
 /// several copies can run on one machine (each with its own
 /// `XDG_CONFIG_HOME` and ports) to test discovery, pairing and the UI.
+/// Whether this desktop shares input without a permission dialog.
+fn no_dialog() -> bool {
+    hopwyn_input::no_permission_dialog()
+}
+
 fn no_input() -> bool {
     std::env::var_os("HOPWYN_NO_INPUT").is_some()
 }
@@ -111,6 +117,8 @@ pub enum Command {
     SetSharing(bool),
     /// When to ask for the input-capture permission.
     SetAskWhen(AskWhen),
+    /// Share the text clipboard with paired devices, or stop.
+    SetClipboard(bool),
     /// The window is up for the permission dialog to sit on; ask now.
     StartInput {
         parent: Option<String>,
@@ -271,9 +279,12 @@ fn start_input(
 ) -> Result<InputParts, String> {
     // Capture first: on GNOME its dialog fails to appear if requested right
     // after a remote-control session closes.
-    let _ = ui.send_blocking(UiEvent::Waiting(
-        "Allow Hopwyn to capture input in the desktop's dialog".into(),
-    ));
+    let silent = no_dialog();
+    if !silent {
+        let _ = ui.send_blocking(UiEvent::Waiting(
+            "Allow Hopwyn to capture input in the desktop's dialog".into(),
+        ));
+    }
     let (capture, capture_rx) =
         LinuxCapture::start_with_token(edges, store.capture_token(), parent.clone())
             .map_err(|e| e.to_string())?;
@@ -283,7 +294,7 @@ fn start_input(
 
     // The remote-control permission: ask once, then reuse the desktop's token.
     let mut token = store.restore_token();
-    if token.is_none() {
+    if token.is_none() && !silent {
         let _ = ui.send_blocking(UiEvent::Waiting(
             "Allow Hopwyn to control input in the desktop's dialog".into(),
         ));
@@ -305,6 +316,8 @@ enum Internal {
     CaptureEnded,
     /// The desktop answered the permission dialogs.
     InputReady(Result<InputParts, String>),
+    /// Text was copied on this computer.
+    Copied(String),
     /// A link to a paired computer is up.
     Connected {
         id: DeviceId,
@@ -404,6 +417,8 @@ struct Service {
     rx: mpsc::UnboundedReceiver<Internal>,
     discovery: Discovery,
     emulator: Option<LinuxEmulator>,
+    /// Follows and sets this computer's clipboard, while that is shared.
+    clipboard: Option<LinuxClipboard>,
     nearby: HashMap<DeviceId, Seen>,
     pairing: Option<Pairing>,
     /// Pairing windows already tried as a guest, so each prompts once.
@@ -659,6 +674,7 @@ impl Service {
             rx,
             discovery,
             emulator: None,
+            clipboard: None,
             nearby: HashMap::new(),
             pairing: None,
             tried: HashSet::new(),
@@ -691,6 +707,9 @@ impl Service {
         self.send_ui(UiEvent::Settings(self.settings));
         self.send_ui(UiEvent::Input(self.input));
         self.want_input();
+        if self.settings.clipboard {
+            self.set_clipboard(true);
+        }
         // Test mode only: open the pairing window at once (no click needed).
         if no_input() && std::env::var_os("HOPWYN_TEST_HOST_ON_START").is_some() {
             self.start_hosting();
@@ -738,11 +757,34 @@ impl Service {
                 }
             }
             Internal::InputReady(result) => self.input_ready(result),
+            Internal::Copied(text) => {
+                self.debug(&format!("copied here: {} bytes", text.len()));
+                if self.settings.clipboard && text.len() <= hopwyn_proto::MAX_CLIPBOARD_TEXT {
+                    let msg = Message::ClipboardText { text };
+                    for p in &mut self.peers {
+                        if let Some(sender) = p.sender.as_mut() {
+                            let _ = sender.send(&msg).await;
+                        }
+                    }
+                }
+            }
             Internal::PeerMessage(id, generation, m) => {
                 let Some(i) = self.peer_index(&id) else {
                     return;
                 };
                 if self.peers.get(i).map(|p| p.generation) != Some(generation) {
+                    return;
+                }
+                if let Message::ClipboardText { text } = m {
+                    self.debug(&format!(
+                        "clipboard from {}: {} bytes",
+                        self.name(i),
+                        text.len()
+                    ));
+                    // Only when the user turned clipboard sharing on here.
+                    if let Some(c) = self.clipboard.as_ref().filter(|_| self.settings.clipboard) {
+                        let _ = c.set(text);
+                    }
                     return;
                 }
                 // Someone else has the cursor: this one keeps its own.
@@ -1213,6 +1255,7 @@ impl Service {
                 self.send_ui(UiEvent::Settings(self.settings));
                 self.want_input();
             }
+            Command::SetClipboard(on) => self.set_clipboard(on),
             Command::StartInput { parent } => {
                 self.debug(&format!("start input (parent {parent:?})"));
                 self.start_input(parent);
@@ -1279,7 +1322,9 @@ impl Service {
                 && p.linked_at
                     .is_some_and(|t| t.elapsed() >= Duration::from_secs(1))
         });
-        if self.input == InputState::Waiting && (self.settings.ask == AskWhen::Startup || online) {
+        // With no dialog to show, there is nothing to put off.
+        let now = self.settings.ask == AskWhen::Startup || online || no_dialog();
+        if self.input == InputState::Waiting && now {
             self.want_input_now();
         }
     }
@@ -1287,8 +1332,12 @@ impl Service {
     fn want_input_now(&mut self) {
         if self.input == InputState::Waiting {
             self.set_input(InputState::Asking);
-            // The window comes up first, so the dialog has a parent.
-            self.send_ui(UiEvent::AskPermission);
+            if no_dialog() {
+                self.start_input(None);
+            } else {
+                // The window comes up first, so the dialog has a parent.
+                self.send_ui(UiEvent::AskPermission);
+            }
         }
     }
 
@@ -1333,6 +1382,43 @@ impl Service {
                 self.debug(&format!("input permission failed: {e}"));
                 self.set_input(InputState::Refused);
             }
+        }
+    }
+
+    /// Starts or stops sharing the clipboard, and remembers the choice.
+    fn set_clipboard(&mut self, on: bool) {
+        if on && self.clipboard.is_none() && !no_input() {
+            match LinuxClipboard::start() {
+                Ok((clipboard, copied)) => {
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || {
+                        while let Ok(text) = copied.recv() {
+                            if tx.send(Internal::Copied(text)).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    self.clipboard = Some(clipboard);
+                }
+                Err(e) => {
+                    self.debug(&format!("clipboard sharing failed: {e}"));
+                    self.send_ui(UiEvent::Notice(
+                        "This desktop can't share the clipboard in the background.".into(),
+                    ));
+                    self.settings.clipboard = false;
+                    let _ = self.store.save_settings(self.settings);
+                    self.send_ui(UiEvent::Settings(self.settings));
+                    return;
+                }
+            }
+        }
+        if !on {
+            self.clipboard = None;
+        }
+        if self.settings.clipboard != on {
+            self.settings.clipboard = on;
+            let _ = self.store.save_settings(self.settings);
+            self.send_ui(UiEvent::Settings(self.settings));
         }
     }
 

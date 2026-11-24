@@ -31,6 +31,10 @@ class Prefs(context: Context) {
     /** Whether the user has read and agreed to what phone control can do. */
     var controlDisclosed by mutableStateOf(store.getBoolean(DISCLOSED, false))
         private set
+    /** Share copied text with paired computers. Off until the user says. */
+    var shareClipboard by mutableStateOf(store.getBoolean(CLIPBOARD, false))
+        private set
+
     /**
      * Whether phone control was on when last seen. If it's off now, Android
      * (or the user) turned it off, and the home screen says so.
@@ -63,6 +67,12 @@ class Prefs(context: Context) {
         store.edit().putBoolean(DISCLOSED, true).apply()
     }
 
+    fun updateShareClipboard(on: Boolean) {
+        shareClipboard = on
+        store.edit().putBoolean(CLIPBOARD, on).apply()
+        Native.nativeSetClipboard(on)
+    }
+
     fun noteControl(on: Boolean) {
         if (controlWasOn == on) return
         controlWasOn = on
@@ -77,6 +87,7 @@ class Prefs(context: Context) {
         private const val NATURAL = "natural_scroll"
         private const val DISCLOSED = "control_disclosed"
         private const val WAS_ON = "control_was_on"
+        private const val CLIPBOARD = "share_clipboard"
 
         @Volatile private var instance: Prefs? = null
 
