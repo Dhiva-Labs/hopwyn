@@ -1,0 +1,1 @@
+New: share the clipboard. Turn on "Share the clipboard" in Settings here and on your computer, and text copied on the computer arrives on your phone; text copied on the phone is sent when you open Hopwyn. Also in this version: Hopwyn reconnects after you change Wi-Fi, pairs by typing the computer's address, and walks you through the Android settings for phone control.

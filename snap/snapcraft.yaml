@@ -48,7 +48,7 @@ parts:
       - libadwaita-1-dev
     override-pull: |
       craftctl default
-      craftctl set version="0.3.0+git$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+      craftctl set version="0.3.1+git$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     override-build: |
       export PATH="/snap/bin:$HOME/.cargo/bin:$PATH"
       # The GNOME extension points LD_LIBRARY_PATH at the SDK's libc, which

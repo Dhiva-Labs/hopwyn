@@ -1,3 +1,12 @@
+hopwyn (0.3.1-0ppa1) resolute; urgency=medium
+
+  * On GNOME, no permission dialog any more: not at startup, and not
+    after a restart.
+  * New "Share the clipboard" setting, off by default: text copied on
+    one device can be pasted on your other paired devices.
+
+ -- Dhivakar R (Dhiva-Labs) <dhivakar1010@gmail.com>  Wed, 25 Nov 2026 03:45:48 +0530
+
 hopwyn (0.3.0-0ppa1) resolute; urgency=medium
 
   * Reconnects after a change of network: each device remembers where it
